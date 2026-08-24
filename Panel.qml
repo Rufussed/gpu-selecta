@@ -25,17 +25,41 @@ Panel {
   property var gpus: []
   property bool isHybrid: false
   property string renderDefault: "amd"
-  property var appGpuAssignments: ({})
   property string copiedNotice: ""
   property bool isUpdating: false
+  property string activeTab: "overview"
 
-  property string newAppLabel: ""
-  property string newAppDesktopFile: ""
+  property var apps: ({})
+  property bool appsLoaded: false
+  property bool appsLoading: false
+  property string appFilter: ""
+  property var expandedGpus: ({})
 
-  readonly property var appKeys: {
-    var keys = Object.keys(root.appGpuAssignments)
+  readonly property var tabList: [
+    { label: "Overview", key: "overview" },
+    { label: "Apps", key: "apps" }
+  ]
+
+  // "amd" is really "the non-NVIDIA GPU" in the render-default toggle — name
+  // it after whichever vendor is actually integrated on this machine (AMD or
+  // Intel) rather than assuming AMD.
+  readonly property string integratedVendor: {
+    for (var i = 0; i < root.gpus.length; i++) {
+      if (root.gpus[i].vendor !== "NVIDIA") return root.gpus[i].vendor
+    }
+    return ""
+  }
+
+  readonly property var filteredAppKeys: {
+    var keys = Object.keys(root.apps)
+    var f = root.appFilter.trim().toLowerCase()
+    if (f !== "") {
+      keys = keys.filter(function(k) {
+        return (root.apps[k].label || k).toLowerCase().indexOf(f) !== -1
+      })
+    }
     keys.sort(function(a, b) {
-      return (root.appGpuAssignments[a].label || a).localeCompare(root.appGpuAssignments[b].label || b)
+      return (root.apps[a].label || a).localeCompare(root.apps[b].label || b)
     })
     return keys
   }
@@ -44,10 +68,35 @@ Panel {
     return Qt.resolvedUrl("scripts/gpu_switch_engine.py").toString().replace(/^file:\/\//, "")
   }
 
+  function escapeHtml(text) {
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  }
+
+  // GPU model strings look like "GA106M [GeForce RTX 3060 Mobile / Max-Q] (rev a1)"
+  // — the bit between "[" and "/" is the actual marketing name and the part
+  // worth drawing the eye to; the chip codename and revision are noise.
+  function formatModelText(model) {
+    if (!model) return ""
+    var start = model.indexOf("[")
+    var slash = start >= 0 ? model.indexOf("/", start) : -1
+    if (start === -1 || slash === -1) return root.escapeHtml(model)
+    var before = model.substring(0, start + 1)
+    var highlight = model.substring(start + 1, slash)
+    var after = model.substring(slash)
+    return root.escapeHtml(before) + "<b><font color=\"" + Color.accent + "\">" +
+      root.escapeHtml(highlight) + "</font></b>" + root.escapeHtml(after)
+  }
+
   function refresh() {
     if (pollProc.running) return
     root.isUpdating = true
     pollProc.running = true
+  }
+
+  function loadApps() {
+    if (listAppsProc.running) return
+    root.appsLoading = true
+    listAppsProc.running = true
   }
 
   function setRenderDefault(target) {
@@ -56,25 +105,27 @@ Panel {
   }
 
   function setAppGpu(appKey, gpu) {
-    controlProc.command = ["python3", root.scriptPath(), "--set-app-gpu", appKey, gpu]
+    var entry = root.apps[appKey] || {}
+    var label = entry.label || appKey
+    var files = (entry.desktopFiles || []).join(",")
+    controlProc.command = ["python3", root.scriptPath(), "--set-app-gpu", appKey, gpu, label, files]
     controlProc.running = true
   }
 
-  function removeApp(appKey) {
-    controlProc.command = ["python3", root.scriptPath(), "--remove-app", appKey]
+  function toggleGpuManage(gpuId) {
+    var updated = Object.assign({}, root.expandedGpus)
+    updated[gpuId] = !updated[gpuId]
+    root.expandedGpus = updated
+  }
+
+  function setPowerProfile(gpuId, level) {
+    controlProc.command = ["python3", root.scriptPath(), "--set-power-profile", gpuId, level]
     controlProc.running = true
   }
 
-  function addApp() {
-    var label = root.newAppLabel.trim()
-    var desktopFile = root.newAppDesktopFile.trim()
-    if (!desktopFile) return
-    if (!label) label = desktopFile.replace(/\.desktop$/, "")
-    var appKey = desktopFile.replace(/\.desktop$/, "").toLowerCase().replace(/[^a-z0-9]+/g, "-")
-    controlProc.command = ["python3", root.scriptPath(), "--add-app", appKey, label, desktopFile, "auto"]
+  function setFanPwm(gpuId, pwmVal) {
+    controlProc.command = ["python3", root.scriptPath(), "--set-fan", gpuId, pwmVal.toString()]
     controlProc.running = true
-    root.newAppLabel = ""
-    root.newAppDesktopFile = ""
   }
 
   function parseOutput(text) {
@@ -85,10 +136,29 @@ Panel {
       root.gpus = data.gpus || []
       root.isHybrid = data.isHybrid === true
       root.renderDefault = data.renderDefault || "amd"
-      root.appGpuAssignments = data.appGpuAssignments || ({})
     } catch (e) {
       console.log("gpu-switch JSON parse error:", e)
     }
+  }
+
+  function parseAppsOutput(text) {
+    root.appsLoading = false
+    root.appsLoaded = true
+    if (!text || text.trim() === "") return
+    try {
+      var data = JSON.parse(text)
+      root.apps = data.apps || ({})
+    } catch (e) {
+      console.log("gpu-switch apps parse error:", e)
+    }
+  }
+
+  Timer {
+    id: liveTimer
+    interval: 2500
+    running: root.opened
+    repeat: true
+    onTriggered: root.refresh()
   }
 
   Timer {
@@ -114,6 +184,20 @@ Panel {
   }
 
   Process {
+    id: listAppsProc
+    command: ["python3", root.scriptPath(), "--list-apps"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.parseAppsOutput(text)
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text) console.log("gpu-switch stderr:", text)
+    }
+    onExited: function(c) { root.appsLoading = false }
+  }
+
+  Process {
     id: controlProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -122,9 +206,27 @@ Panel {
           try {
             var res = JSON.parse(text)
             if (res.status === "success") {
-              if (res.renderDefault) root.copiedNotice = "Default renderer: " + (res.renderDefault === "nvidia" ? "NVIDIA" : "AMD")
-              else if (res.appKey && res.gpu) root.copiedNotice = (res.label || res.appKey) + " -> " + res.gpu.toUpperCase()
-              else if (res.appKey) root.copiedNotice = "Removed " + res.appKey
+              if (res.renderDefault) {
+                root.copiedNotice = "Default renderer: " + (res.renderDefault === "nvidia" ? "Discrete (NVIDIA)" : ("Integrated" + (root.integratedVendor ? " (" + root.integratedVendor + ")" : "")))
+              } else if (res.appKey && res.gpu) {
+                // The pill highlight already shows the new selection — no
+                // need for a redundant top-of-panel banner on every click.
+                // Clear any stale notice so an older one doesn't linger.
+                root.copiedNotice = ""
+                if (root.apps[res.appKey]) {
+                  // Mutating root.apps[key] in place wouldn't notify QML's
+                  // bindings — reassign the whole object so delegates re-evaluate.
+                  var updatedApps = Object.assign({}, root.apps)
+                  updatedApps[res.appKey] = Object.assign({}, updatedApps[res.appKey], { gpu: res.gpu })
+                  root.apps = updatedApps
+                }
+              } else if (res.level) {
+                root.copiedNotice = "Power governor: " + res.level
+              } else if (res.mode === "auto") {
+                root.copiedNotice = "Fan: Automatic"
+              } else if (res.pwm !== undefined) {
+                root.copiedNotice = "Fan PWM: " + res.pwm
+              }
               noticeTimer.restart()
             } else if (res.status === "error") {
               root.copiedNotice = "Error: " + (res.message || "unknown")
@@ -142,6 +244,7 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       root.refresh()
+      if (!root.appsLoaded) root.loadApps()
       Qt.callLater(function() {
         if (keyCatcher) keyCatcher.forceActiveFocus()
       })
@@ -158,7 +261,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
 
-    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(440))
     contentHeight: panel.fittedContentHeight(mainLayout.implicitHeight, Style.space(620))
 
     PanelKeyCatcher {
@@ -224,7 +327,7 @@ Panel {
             id: heroAction
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            iconText: ""
+            iconText: ""
             tooltipText: root.isUpdating ? "Refreshing..." : "Refresh ('R')"
             foreground: root.isUpdating ? Color.accent : root.foreground
             rotation: 0
@@ -262,193 +365,440 @@ Panel {
           }
         }
 
+        // ------------------ NAVIGATION TABS ------------------
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Repeater {
+            model: root.tabList
+            delegate: BorderSurface {
+              readonly property bool isSelected: root.activeTab === modelData.key
+              implicitWidth: tabText.implicitWidth + Style.space(14)
+              implicitHeight: tabText.implicitHeight + Style.space(8)
+              radius: Style.cornerRadius
+              color: isSelected ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
+              borderSpec: isSelected
+                ? Border.controlSpec("selected", Color.accent, Color.accent)
+                : Border.controlSpec("normal", root.dim, Color.accent)
+
+              Text {
+                textFormat: Text.PlainText
+                id: tabText
+                anchors.centerIn: parent
+                text: modelData.label
+                color: isSelected ? root.foreground : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: isSelected
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.activeTab = modelData.key
+                  if (modelData.key === "apps" && !root.appsLoaded) root.loadApps()
+                }
+              }
+            }
+          }
+        }
+
         PanelSeparator {
           width: parent.width
         }
 
-        // ------------------ NOT A HYBRID SYSTEM NOTICE ------------------
-        Text {
-          visible: !root.isHybrid
-          textFormat: Text.PlainText
+        // =========================================================================
+        // TAB: OVERVIEW
+        // =========================================================================
+        Column {
+          visible: root.activeTab === "overview"
           width: parent.width
-          text: "This system doesn't have a hybrid AMD/NVIDIA (or Intel/NVIDIA) setup with more than one GPU, so there's nothing to route between."
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.Wrap
-        }
+          spacing: Style.space(10)
 
-        // ------------------ GLOBAL DEFAULT RENDERER ------------------
-        BorderSurface {
-          visible: root.isHybrid
-          width: parent.width
-          implicitHeight: globalCol.implicitHeight + Style.space(16)
-          color: Style.hoverFillFor(root.foreground, root.foreground)
-          borderSpec: Border.controlSpec("normal", root.dim, Color.accent)
-          radius: Style.cornerRadius
+          Text {
+            visible: !root.isHybrid
+            textFormat: Text.PlainText
+            width: parent.width
+            text: "This system doesn't have a hybrid AMD/NVIDIA (or Intel/NVIDIA) setup with more than one GPU, so there's nothing to route between."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
+          }
 
-          Column {
-            id: globalCol
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: Style.space(8)
-            spacing: Style.space(6)
+          // ------------------ GLOBAL DEFAULT RENDERER ------------------
+          BorderSurface {
+            visible: root.isHybrid
+            width: parent.width
+            implicitHeight: globalCol.implicitHeight + Style.space(16)
+            color: Style.hoverFillFor(root.foreground, root.foreground)
+            borderSpec: Border.controlSpec("normal", root.dim, Color.accent)
+            radius: Style.cornerRadius
 
-            Text {
-              textFormat: Text.PlainText
-              text: "Global Default (new apps)"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-            }
-
-            Row {
+            Column {
+              id: globalCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.margins: Style.space(8)
               spacing: Style.space(6)
 
-              Repeater {
-                model: [
-                  { key: "amd", label: "AMD (default)" },
-                  { key: "nvidia", label: "NVIDIA (offload)" }
-                ]
+              Text {
+                textFormat: Text.PlainText
+                text: "Global Default"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
 
-                delegate: BorderSurface {
-                  readonly property bool isActive: root.renderDefault === modelData.key
-                  implicitWidth: globalChoiceText.implicitWidth + Style.space(14)
-                  implicitHeight: globalChoiceText.implicitHeight + Style.space(8)
-                  radius: Style.cornerRadius
-                  color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
-                  borderSpec: isActive
-                    ? Border.controlSpec("selected", Color.accent, Color.accent)
-                    : Border.controlSpec("normal", root.dim, Color.accent)
+              Row {
+                spacing: Style.space(6)
 
-                  Text {
-                    textFormat: Text.PlainText
-                    id: globalChoiceText
-                    anchors.centerIn: parent
-                    text: modelData.label
-                    color: isActive ? root.foreground : root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: isActive
-                  }
+                Repeater {
+                  model: [
+                    { key: "amd", label: root.integratedVendor ? "Integrated (" + root.integratedVendor + ")" : "Integrated" },
+                    { key: "nvidia", label: "Discrete (NVIDIA)" }
+                  ]
 
-                  MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.setRenderDefault(modelData.key)
+                  delegate: BorderSurface {
+                    readonly property bool isActive: root.renderDefault === modelData.key
+                    implicitWidth: globalChoiceText.implicitWidth + Style.space(14)
+                    implicitHeight: globalChoiceText.implicitHeight + Style.space(8)
+                    radius: Style.cornerRadius
+                    color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
+                    borderSpec: isActive
+                      ? Border.controlSpec("selected", Color.accent, Color.accent)
+                      : Border.controlSpec("normal", root.dim, Color.accent)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      id: globalChoiceText
+                      anchors.centerIn: parent
+                      text: modelData.label
+                      color: isActive ? root.foreground : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: isActive
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.setRenderDefault(modelData.key)
+                    }
                   }
                 }
               }
-            }
 
-            Text {
-              textFormat: Text.PlainText
-              width: parent.width
-              text: "Not a hardware switch — applies to apps launched from now on. Already-running apps keep their current GPU."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: "Not a hardware switch — applies to apps launched from now on. Already-running apps keep their current GPU."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
             }
           }
-        }
 
-        // ------------------ PER-APP ASSIGNMENTS ------------------
-        Column {
-          visible: root.isHybrid
-          width: parent.width
-          spacing: Style.space(8)
-
-          Text {
-            textFormat: Text.PlainText
-            text: "Per-App GPU"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            font.bold: true
-          }
-
+          // ------------------ LIVE TELEMETRY (both GPUs) ------------------
           Repeater {
-            model: root.appKeys
+            model: root.gpus
 
             delegate: BorderSurface {
-              readonly property string appKey: modelData
-              readonly property var entry: root.appGpuAssignments[appKey] || ({})
+              readonly property var gpu: modelData
+              readonly property bool expanded: Boolean(root.expandedGpus[gpu.id])
               width: parent.width
-              implicitHeight: appRow.implicitHeight + Style.space(12)
-              radius: Style.cornerRadius
+              implicitHeight: gpuCardCol.implicitHeight + Style.space(14)
               color: Style.hoverFillFor(root.foreground, root.foreground)
               borderSpec: Border.controlSpec("normal", root.dim, Color.accent)
+              radius: Style.cornerRadius
 
               Column {
-                id: appRow
+                id: gpuCardCol
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.margins: Style.space(8)
                 spacing: Style.space(4)
 
-                Row {
+                Item {
                   width: parent.width
-                  spacing: Style.space(6)
+                  implicitHeight: Math.max(headerRow.implicitHeight, manageBtn.implicitHeight)
 
-                  Text {
-                    textFormat: Text.PlainText
-                    text: entry.label || appKey
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    font.bold: true
-                    width: parent.width - removeBtn.implicitWidth - Style.space(6)
-                    elide: Text.ElideRight
+                  Row {
+                    id: headerRow
+                    anchors.left: parent.left
+                    anchors.right: manageBtn.left
+                    anchors.rightMargin: Style.space(6)
+                    spacing: Style.space(8)
+
+                    Text {
+                      id: vendorText
+                      textFormat: Text.PlainText
+                      text: gpu.vendor
+                      color: gpu.vendor === "NVIDIA" ? Color.accent : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+
+                    Text {
+                      textFormat: Text.StyledText
+                      text: root.formatModelText(gpu.model)
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                      width: parent.width - vendorText.width - Style.space(8)
+                    }
                   }
 
-                  PanelActionButton {
-                    id: removeBtn
-                    iconText: "󰅖"
-                    tooltipText: "Reset / remove"
-                    foreground: root.dim
-                    onClicked: root.removeApp(appKey)
+                  BorderSurface {
+                    id: manageBtn
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    implicitWidth: manageRow.implicitWidth + Style.space(14)
+                    implicitHeight: manageRow.implicitHeight + Style.space(6)
+                    radius: Style.cornerRadius
+                    color: expanded ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
+                    borderSpec: expanded
+                      ? Border.controlSpec("selected", Color.accent, Color.accent)
+                      : Border.controlSpec("normal", root.dim, Color.accent)
+
+                    Row {
+                      id: manageRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: ""
+                        color: expanded ? Color.accent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "Manage"
+                        color: expanded ? root.foreground : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: expanded
+                      }
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.toggleGpuManage(gpu.id)
+                    }
                   }
                 }
 
                 Row {
-                  spacing: Style.space(6)
+                  spacing: Style.space(14)
 
-                  Repeater {
-                    model: [
-                      { key: "amd", label: "AMD" },
-                      { key: "auto", label: "Auto" },
-                      { key: "nvidia", label: "NVIDIA" }
-                    ]
+                  Text {
+                    textFormat: Text.PlainText
+                    text: (gpu.tempC !== null && gpu.tempC !== undefined) ? Math.round(gpu.tempC) + "°C" : "— °C"
+                    color: (gpu.tempC !== null && gpu.tempC >= 80) ? root.urgent : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
 
-                    delegate: BorderSurface {
-                      readonly property bool isActive: entry.gpu === modelData.key
-                      implicitWidth: appChoiceText.implicitWidth + Style.space(12)
-                      implicitHeight: appChoiceText.implicitHeight + Style.space(6)
-                      radius: Style.cornerRadius
-                      color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
-                      borderSpec: isActive
-                        ? Border.controlSpec("selected", Color.accent, Color.accent)
-                        : Border.controlSpec("normal", root.dim, Color.accent)
+                  Text {
+                    textFormat: Text.PlainText
+                    text: (gpu.busyPercent !== null && gpu.busyPercent !== undefined) ? gpu.busyPercent + "% busy" : "— busy"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
 
-                      Text {
-                        textFormat: Text.PlainText
-                        id: appChoiceText
-                        anchors.centerIn: parent
-                        text: modelData.label
-                        color: isActive ? root.foreground : root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.bold: isActive
+                  Text {
+                    textFormat: Text.PlainText
+                    text: (gpu.powerWatts !== null && gpu.powerWatts !== undefined) ? gpu.powerWatts + " W" : "— W"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                Rectangle {
+                  id: vramBarTrack
+                  visible: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined
+                  width: parent.width
+                  height: Style.space(6)
+                  radius: height / 2
+                  color: Qt.darker(root.foreground, 4)
+
+                  Rectangle {
+                    width: vramBarTrack.width * Math.max(0, Math.min(1, (gpu.vramPercent || 0) / 100))
+                    height: parent.height
+                    radius: height / 2
+                    color: (gpu.vramPercent || 0) >= 90 ? root.urgent : ((gpu.vramPercent || 0) >= 70 ? Color.accent : "#87c095")
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  visible: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined
+                  text: Math.round(gpu.vramUsedMb || 0) + " / " + Math.round(gpu.vramTotalMb || 0) + " MB VRAM" +
+                        ((gpu.vramPercent !== null && gpu.vramPercent !== undefined) ? " (" + gpu.vramPercent + "%)" : "")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                // ------------------ MANAGE (power governor + fan) ------------------
+                Column {
+                  visible: expanded
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  PanelSeparator { width: parent.width }
+
+                  Column {
+                    width: parent.width
+                    spacing: Style.space(4)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Power Governor"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: !gpu.supportsTuning
+                      width: parent.width
+                      text: "Not supported: DPM governors are amdgpu-only (driver: " + (gpu.driver || "unknown") + ")"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      wrapMode: Text.Wrap
+                    }
+
+                    Row {
+                      visible: gpu.supportsTuning
+                      spacing: Style.space(6)
+
+                      Repeater {
+                        model: [
+                          { key: "auto", label: "Auto" },
+                          { key: "high", label: "High" },
+                          { key: "low", label: "Low" },
+                          { key: "profile_peak", label: "Peak" }
+                        ]
+
+                        delegate: BorderSurface {
+                          readonly property bool isActive: gpu.performanceLevel === modelData.key
+                          implicitWidth: govText.implicitWidth + Style.space(12)
+                          implicitHeight: govText.implicitHeight + Style.space(6)
+                          radius: Style.cornerRadius
+                          color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
+                          borderSpec: isActive
+                            ? Border.controlSpec("selected", Color.accent, Color.accent)
+                            : Border.controlSpec("normal", root.dim, Color.accent)
+
+                          Text {
+                            textFormat: Text.PlainText
+                            id: govText
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            color: isActive ? root.foreground : root.dim
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.bold: isActive
+                          }
+
+                          MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.setPowerProfile(gpu.id, modelData.key)
+                          }
+                        }
                       }
+                    }
+                  }
 
-                      MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.setAppGpu(appKey, modelData.key)
+                  Column {
+                    width: parent.width
+                    spacing: Style.space(4)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Fan"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: !gpu.supportsFanControl
+                      width: parent.width
+                      text: gpu.vendor === "NVIDIA"
+                        ? "Not supported: NVIDIA laptop GPUs have no fan PWM node (EC-controlled)."
+                        : "Not supported: no fan PWM node exposed (driver: " + (gpu.driver || "unknown") + ")"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      wrapMode: Text.Wrap
+                    }
+
+                    Flow {
+                      visible: gpu.supportsFanControl
+                      width: parent.width
+                      spacing: Style.space(6)
+
+                      Repeater {
+                        model: [
+                          { key: "auto", label: "Auto", pwm: "auto" },
+                          { key: "35", label: "35%", pwm: "90" },
+                          { key: "60", label: "60%", pwm: "153" },
+                          { key: "80", label: "80%", pwm: "204" },
+                          { key: "100", label: "100%", pwm: "255" }
+                        ]
+
+                        delegate: BorderSurface {
+                          readonly property bool isActive: modelData.key === "auto"
+                            ? gpu.fanMode === "auto"
+                            : (gpu.fanMode === "manual" && modelData.key !== "auto")
+                          implicitWidth: fanText.implicitWidth + Style.space(12)
+                          implicitHeight: fanText.implicitHeight + Style.space(6)
+                          radius: Style.cornerRadius
+                          color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
+                          borderSpec: isActive
+                            ? Border.controlSpec("selected", Color.accent, Color.accent)
+                            : Border.controlSpec("normal", root.dim, Color.accent)
+
+                          Text {
+                            textFormat: Text.PlainText
+                            id: fanText
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            color: isActive ? root.foreground : root.dim
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.bold: isActive
+                          }
+
+                          MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.setFanPwm(gpu.id, modelData.pwm)
+                          }
+                        }
                       }
                     }
                   }
@@ -458,52 +808,185 @@ Panel {
           }
         }
 
-        // ------------------ ADD APP ------------------
-        BorderSurface {
-          visible: root.isHybrid
+        // =========================================================================
+        // TAB: APPS
+        // =========================================================================
+        Column {
+          visible: root.activeTab === "apps"
           width: parent.width
-          implicitHeight: addAppCol.implicitHeight + Style.space(16)
-          color: "transparent"
-          borderSpec: Border.controlSpec("normal", root.dim, root.dim)
-          radius: Style.cornerRadius
+          spacing: Style.space(8)
 
-          Column {
-            id: addAppCol
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: Style.space(8)
+          Row {
+            width: parent.width
             spacing: Style.space(6)
 
-            Text {
-              textFormat: Text.PlainText
-              text: "Add App"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-            }
-
             TextField {
-              width: parent.width
-              placeholderText: "Label (e.g. GIMP)"
-              text: root.newAppLabel
-              onTextChanged: root.newAppLabel = text
-            }
-
-            TextField {
-              width: parent.width
-              placeholderText: "Desktop file (e.g. gimp.desktop) — find via ls /usr/share/applications"
-              text: root.newAppDesktopFile
-              onTextChanged: root.newAppDesktopFile = text
+              width: parent.width - refreshAppsBtn.implicitWidth - Style.space(6)
+              placeholderText: "Filter apps..."
+              text: root.appFilter
+              onTextChanged: root.appFilter = text
             }
 
             PanelActionButton {
-              iconText: "󰐕"
-              tooltipText: "Add"
-              foreground: Color.accent
-              onClicked: root.addApp()
+              id: refreshAppsBtn
+              iconText: ""
+              tooltipText: root.appsLoading ? "Scanning installed apps..." : "Rescan installed apps"
+              foreground: root.appsLoading ? Color.accent : root.foreground
+              onClicked: root.loadApps()
+
+              RotationAnimation on rotation {
+                from: 0
+                to: 360
+                duration: 800
+                loops: Animation.Infinite
+                running: root.appsLoading
+              }
             }
+          }
+
+          Text {
+            visible: root.appsLoading && Object.keys(root.apps).length === 0
+            textFormat: Text.PlainText
+            text: "Scanning installed applications..."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            visible: !root.appsLoading && root.filteredAppKeys.length === 0
+            textFormat: Text.PlainText
+            text: Object.keys(root.apps).length === 0 ? "No apps found." : "No apps match your filter."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Item {
+            width: parent.width
+            height: Math.min(appsColumn.implicitHeight, Style.space(380))
+
+            Flickable {
+              id: appsFlick
+              anchors.left: parent.left
+              anchors.right: appsScrollTrack.left
+              anchors.rightMargin: Style.space(6)
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              contentWidth: width
+              contentHeight: appsColumn.implicitHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+
+              Column {
+                id: appsColumn
+                width: appsFlick.width
+                spacing: Style.space(6)
+
+                Repeater {
+                  model: root.filteredAppKeys
+
+                  delegate: BorderSurface {
+                    readonly property string appKey: modelData
+                    readonly property var entry: root.apps[appKey] || ({})
+                    width: appsColumn.width
+                    implicitHeight: appRowCol.implicitHeight + Style.space(10)
+                    radius: Style.cornerRadius
+                    color: Style.hoverFillFor(root.foreground, root.foreground)
+                    borderSpec: Border.controlSpec("normal", root.dim, Color.accent)
+
+                    Column {
+                      id: appRowCol
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.space(8)
+                      spacing: Style.space(4)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: entry.label || appKey
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                        width: parent.width
+                        elide: Text.ElideRight
+                      }
+
+                      Row {
+                        spacing: Style.space(6)
+
+                        Repeater {
+                          model: [
+                            { key: "amd", label: "AMD" },
+                            { key: "auto", label: "Default" },
+                            { key: "nvidia", label: "NVIDIA" }
+                          ]
+
+                          delegate: BorderSurface {
+                            readonly property bool isActive: entry.gpu === modelData.key
+                            implicitWidth: appChoiceText.implicitWidth + Style.space(12)
+                            implicitHeight: appChoiceText.implicitHeight + Style.space(6)
+                            radius: Style.cornerRadius
+                            color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
+                            borderSpec: isActive
+                              ? Border.controlSpec("selected", Color.accent, Color.accent)
+                              : Border.controlSpec("normal", root.dim, Color.accent)
+
+                            Text {
+                              textFormat: Text.PlainText
+                              id: appChoiceText
+                              anchors.centerIn: parent
+                              text: modelData.label
+                              color: isActive ? root.foreground : root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              font.bold: isActive
+                            }
+
+                            MouseArea {
+                              anchors.fill: parent
+                              cursorShape: Qt.PointingHandCursor
+                              onClicked: root.setAppGpu(appKey, modelData.key)
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            Rectangle {
+              id: appsScrollTrack
+              visible: appsFlick.contentHeight > appsFlick.height
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              width: Style.space(6)
+              radius: width / 2
+              color: Qt.darker(root.foreground, 4)
+
+              Rectangle {
+                width: parent.width
+                radius: width / 2
+                color: root.dim
+                y: appsFlick.visibleArea.yPosition * appsScrollTrack.height
+                height: Math.max(Style.space(16), appsFlick.visibleArea.heightRatio * appsScrollTrack.height)
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: root.filteredAppKeys.length + " apps · unpinned apps (\"Default\") follow the Overview tab's global default"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
           }
         }
       }

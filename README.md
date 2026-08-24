@@ -1,15 +1,16 @@
 # GPU Switch for Omarchy
 
 An [Omarchy](https://omarchy.org/) shell plugin for hybrid AMD/NVIDIA (or Intel/NVIDIA)
-laptops: a global default-renderer toggle plus per-app GPU pinning, using PRIME
-render offload.
+laptops: live telemetry for every GPU, a global default-renderer toggle, and
+per-app GPU pinning via PRIME render offload — plus basic power/fan controls
+where the hardware actually supports them.
 
 ## What this is (and isn't)
 
 On a muxless hybrid laptop, there's no hardware switch between GPUs — the
 discrete GPU has no display path of its own, so the integrated GPU always
-drives the screen. **This plugin does not change that.** What it controls is
-which GPU newly-launched *apps* render on:
+drives the screen. **This plugin does not change that.** What the routing
+features control is which GPU newly-launched *apps* render on:
 
 - **Global toggle**: sets PRIME offload environment variables for the whole
   session, applied live via Omarchy's Hyprland toggle mechanism — no restart
@@ -17,18 +18,17 @@ which GPU newly-launched *apps* render on:
 - **Per-app pinning**: rewrites a specific app's `.desktop` launcher entry
   (the standard XDG override mechanism — this is the same technique GNOME's
   own "Launch using Discrete Graphics Card" uses) so that app always renders
-  on the GPU you choose, regardless of the global toggle. Good for apps you
-  always want on the discrete GPU (Blender, Unreal Engine, games) or always
-  want to keep off it (VS Code, LibreOffice, browsers) so the discrete GPU
-  doesn't wake for apps that don't need it.
+  on the GPU you choose, regardless of the global toggle. The full list of
+  installed apps is scanned automatically — nothing is pre-pinned; every app
+  starts at "Default" (follow the global toggle) until you change it.
 
 Per-app pinning is the more power-efficient option for apps you use
 regularly: the discrete GPU only wakes while that specific app is open,
 rather than for an entire session (or, worse, for literally everything if
 the global toggle is left on).
 
-Neither mechanism can affect a process that's already running — env vars
-only apply at process launch.
+Neither routing mechanism can affect a process that's already running — env
+vars only apply at process launch.
 
 ## Install
 
@@ -60,36 +60,38 @@ omarchy plugin remove rufussed.gpu-switch
 
 This unregisters the widget and removes its checkout. It does **not**
 automatically revert any per-app `.desktop` overrides or the global toggle
-file — reset each app to `Auto` and turn the global toggle back to `AMD`
-from the panel *before* removing the plugin, so nothing is left pinned to a
-GPU with no way to change it back. (If you forget: delete
-`~/.local/state/omarchy/toggles/hypr/gpu-switch-render-default.lua` for the
-global toggle, and any `~/.local/share/applications/<app>.desktop` file that
-starts with `# Written by the GPU Switch plugin` for per-app overrides —
-originals are preserved in `~/.config/omarchy/gpu-switch/backups/` if you
-want to restore them by hand.)
+file — reset each pinned app back to `Default` and turn the global toggle
+back to `Integrated` from the panel *before* removing the plugin, so nothing
+is left pinned to a GPU with no way to change it back. (If you forget:
+delete `~/.local/state/omarchy/toggles/hypr/gpu-switch-render-default.lua`
+for the global toggle, and any `~/.local/share/applications/<app>.desktop`
+file that starts with `# Written by the GPU Switch plugin` for per-app
+overrides — originals are preserved in
+`~/.config/omarchy/gpu-switch/backups/` if you want to restore them by
+hand.)
 
 ## Dependencies
 
-None beyond what Omarchy already provides: `python3`, `hyprctl`. No external
-packages, services, or `pkexec`/root access are required.
+`python3`, `hyprctl`, `lspci` — all already present on a standard Omarchy
+install. `nvidia-smi` is used opportunistically for NVIDIA telemetry/
+persistence-mode when present. No other external packages or services.
 
 ## Use
 
 - **Click** the bar icon to open the panel.
-- **Global Default**: AMD / NVIDIA pills at the top — sets the session-wide
-  default for new app launches.
-- **Per-App GPU**: each listed app has AMD / Auto / NVIDIA pills. `Auto`
-  means "follow the global default"; AMD/NVIDIA pin it regardless of the
-  global setting.
-- **Add App**: pin any other installed app by its `.desktop` file name
-  (list them with `ls /usr/share/applications` or
-  `ls ~/.local/share/applications`).
-- The ✕ button on an app resets it back to `Auto` (built-in entries) or
-  removes it entirely (apps you added yourself).
-
-Seeded defaults: Blender and Unreal Engine → NVIDIA, VS Code and
-LibreOffice → AMD. Edit or remove these like any other entry.
+- **Overview tab**: the **Global Default** toggle (`Integrated` / `Discrete`,
+  labeled with whatever vendor is actually detected — e.g. "Integrated
+  (AMD)" / "Discrete (NVIDIA)") plus a live card per GPU showing
+  temperature, busy %, power draw, and a VRAM usage bar.
+  - Each GPU card has a **Manage** button (top right) that reveals basic
+    Power Governor (`Auto`/`High`/`Low`/`Peak`) and Fan (`Auto`/`35%`/`60%`/
+    `80%`/`100%`) controls, when the hardware actually exposes them over
+    sysfs — an honest "not supported" note otherwise (e.g. NVIDIA laptop
+    GPUs never expose fan control on Linux; many integrated GPUs have no fan
+    node at all since the fan is EC-controlled).
+- **Apps tab**: every installed app, auto-discovered and filterable, each
+  with `AMD` / `Default` / `NVIDIA` pills. `Default` means "follow the
+  Overview tab's global toggle."
 
 ## How it works
 
@@ -102,20 +104,26 @@ live.
 **Per-app pinning** writes an override to `~/.local/share/applications/<app>.desktop`,
 prefixing every `Exec=` line with `env __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia __VK_LAYER_NV_optimus=NVIDIA_only`
 (NVIDIA) or `env -u __NV_PRIME_RENDER_OFFLOAD -u __GLX_VENDOR_LIBRARY_NAME -u __VK_LAYER_NV_optimus`
-(force AMD). `TryExec=` is left untouched, since the desktop entry spec
-requires it to stay a bare executable path. The original file is snapshotted
-to `~/.config/omarchy/gpu-switch/backups/` the first time an app is touched,
-so resetting an app to `Auto` restores it exactly (or removes the override
-entirely, revealing the system default, if one exists).
+(force the integrated GPU). `TryExec=` is left untouched, since the desktop
+entry spec requires it to stay a bare executable path. The original file is
+snapshotted to `~/.config/omarchy/gpu-switch/backups/` the first time an app
+is touched, so resetting an app to `Default` restores it exactly (or removes
+the override entirely, revealing the system default, if one exists).
 
 This only affects apps launched through a `.desktop` entry — the app grid,
 Omarchy's menu, launchers like Walker/fuzzel. It doesn't affect a binary run
 directly from a terminal.
 
+**Power governor / fan control** write directly to the same amdgpu sysfs
+nodes tools like LACT use (`power_dpm_force_performance_level`,
+`hwmon/pwm1`), falling back to `pkexec` if your user doesn't already have
+write permission there. NVIDIA fan control isn't offered — Linux has no
+supported path for it on laptop GPUs, on any driver.
+
 ## Config
 
-State lives in `~/.config/omarchy/gpu-switch/apps.json` if you'd rather edit
-it directly:
+Per-app state lives in `~/.config/omarchy/gpu-switch/apps.json` if you'd
+rather edit it directly:
 
 ```json
 {
@@ -123,20 +131,27 @@ it directly:
 }
 ```
 
+Any app not listed here defaults to `"auto"` (follow the global toggle) —
+this file only needs entries for apps you've actually pinned.
+
 ## Security
 
-Telemetry (which GPUs exist) is 100% unprivileged sysfs reads. Applying a
-setting only ever writes to files already owned by your user account
-(`~/.config`, `~/.local/share/applications`, `~/.local/state`) — no root or
-`pkexec` is ever needed, unlike GPU tuning plugins that write to sysfs.
+GPU/app telemetry is 100% unprivileged reads (sysfs, `.desktop` files).
+Render routing (global toggle, per-app pinning) only ever writes to files
+already owned by your user account (`~/.config`, `~/.local/share/applications`,
+`~/.local/state`) — no root or `pkexec` needed for those. Power governor and
+fan control *do* write to sysfs and may prompt for `pkexec` authentication
+if your udev rules don't already grant write access there, same as any
+other GPU tuning tool.
 
 ## Credits
 
-GPU vendor/driver detection is adapted from
-[OmaGPU](https://github.com/ucmz851/omagpu) by ucmz851 (MIT licensed). This
-plugin is a separate, independent tool focused on GPU *launch routing*
-rather than telemetry/tuning — see OmaGPU if you want fan curves, DPM power
-governors, and hardware telemetry instead.
+GPU vendor/driver detection and the power governor/fan sysfs handling
+follow the same approach as [OmaGPU](https://github.com/ucmz851/omagpu) by
+ucmz851 (MIT licensed) — LACT-inspired reads of `power_dpm_force_performance_level`
+and `hwmon`. OmaGPU remains the more complete tuning/telemetry dashboard if
+that's all you need; this plugin's focus is GPU *launch routing*, with basic
+tuning included for convenience on hybrid systems.
 
 ## License
 
