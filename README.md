@@ -52,6 +52,28 @@ omarchy-shell shell rescanPlugins
 QuickShell's file watcher doesn't follow symlinks, so after edits run
 `omarchy restart shell`.
 
+## Remove
+
+```sh
+omarchy plugin remove rufussed.gpu-switch
+```
+
+This unregisters the widget and removes its checkout. It does **not**
+automatically revert any per-app `.desktop` overrides or the global toggle
+file — reset each app to `Auto` and turn the global toggle back to `AMD`
+from the panel *before* removing the plugin, so nothing is left pinned to a
+GPU with no way to change it back. (If you forget: delete
+`~/.local/state/omarchy/toggles/hypr/gpu-switch-render-default.lua` for the
+global toggle, and any `~/.local/share/applications/<app>.desktop` file that
+starts with `# Written by the GPU Switch plugin` for per-app overrides —
+originals are preserved in `~/.config/omarchy/gpu-switch/backups/` if you
+want to restore them by hand.)
+
+## Dependencies
+
+None beyond what Omarchy already provides: `python3`, `hyprctl`. No external
+packages, services, or `pkexec`/root access are required.
+
 ## Use
 
 - **Click** the bar icon to open the panel.
