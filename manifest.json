@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "rufussed.gpu-switch",
+  "name": "GPU Switch",
+  "version": "1.0.0",
+  "author": "rufussed",
+  "license": "MIT",
+  "description": "Global and per-app GPU renderer switching for hybrid AMD/NVIDIA laptops via PRIME render offload.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "GPU Switch",
+    "description": "Global default-renderer toggle and per-app GPU pinning for hybrid laptops (PRIME render offload).",
+    "category": "System",
+    "aliases": [
+      "gpu",
+      "nvidia",
+      "prime",
+      "offload",
+      "hybrid",
+      "switcheroo",
+      "optimus"
+    ],
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
