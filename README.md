@@ -66,9 +66,9 @@ is left pinned to a GPU with no way to change it back. (If you forget:
 delete `~/.local/state/omarchy/toggles/hypr/gpu-switch-render-default.lua`
 for the global toggle, and any `~/.local/share/applications/<app>.desktop`
 file that starts with `# Written by the GPU Switch plugin` for per-app
-overrides — originals are preserved in
-`~/.config/omarchy/gpu-switch/backups/` if you want to restore them by
-hand.)
+overrides, plus `~/.config/omarchy/gpu-switch/wrappers/` — originals are
+preserved in `~/.config/omarchy/gpu-switch/backups/` if you want to restore
+them by hand.)
 
 ## Dependencies
 
@@ -101,14 +101,33 @@ Omarchy's own Hyprland toggle-file convention — `hl.env()` calls there are
 re-applied on every `hyprctl reload`, which is what makes this take effect
 live.
 
-**Per-app pinning** writes an override to `~/.local/share/applications/<app>.desktop`,
-prefixing every `Exec=` line with `env __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia __VK_LAYER_NV_optimus=NVIDIA_only`
-(NVIDIA) or `env -u __NV_PRIME_RENDER_OFFLOAD -u __GLX_VENDOR_LIBRARY_NAME -u __VK_LAYER_NV_optimus`
-(force the integrated GPU). `TryExec=` is left untouched, since the desktop
-entry spec requires it to stay a bare executable path. The original file is
-snapshotted to `~/.config/omarchy/gpu-switch/backups/` the first time an app
-is touched, so resetting an app to `Default` restores it exactly (or removes
-the override entirely, revealing the system default, if one exists).
+**Per-app pinning** writes an override to `~/.local/share/applications/<app>.desktop`
+where every `Exec=` line points at a small generated wrapper script in
+`~/.config/omarchy/gpu-switch/wrappers/` that exports (or unsets) the PRIME
+offload env vars and then `exec`s the real binary, e.g.:
+
+```sh
+#!/bin/sh
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export __VK_LAYER_NV_optimus=NVIDIA_only
+exec /usr/bin/chromium "$@"
+```
+
+A wrapper is used instead of prefixing `Exec=` directly with `env VAR=val ...`
+because some launchers only look at the *first* whitespace-delimited token of
+`Exec=` to find the real executable (Omarchy's own browser-open shortcut does
+this) — with an `env ...` prefix that token is literally `env`, which such a
+launcher then runs with no command instead of the app. Routing through a
+wrapper keeps that first token a real, directly-executable path, so both
+naive and fully spec-compliant launchers work. Any `%f`/`%F`/`%u`/`%U` field
+code stays in the visible `Exec=` line, after the wrapper path, so
+argument/URL substitution still works normally. `TryExec=` is left untouched,
+since the desktop entry spec requires it to stay a bare executable path. The
+original file is snapshotted to `~/.config/omarchy/gpu-switch/backups/` the
+first time an app is touched, so resetting an app to `Default` restores it
+exactly (or removes the override entirely, revealing the system default, if
+one exists) and removes that app's wrapper scripts.
 
 This only affects apps launched through a `.desktop` entry — the app grid,
 Omarchy's menu, launchers like Walker/fuzzel. It doesn't affect a binary run

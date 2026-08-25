@@ -16,11 +16,17 @@ What this does is control which GPU newly-launched apps render on:
   processes.
 - Per-app pinning: rewrites a .desktop launcher entry in
   ~/.local/share/applications/ (the standard XDG override mechanism — this is
-  exactly how GNOME's own "Launch using Discrete Graphics Card" works),
-  prefixing every Exec= line with `env VAR=val ...` (NVIDIA) or
-  `env -u VAR ...` (force AMD, overriding the global toggle). TryExec= is
-  never touched, since the desktop spec requires it to stay a bare
-  executable path for existence checks.
+  exactly how GNOME's own "Launch using Discrete Graphics Card" works), so
+  each Exec= line points at a small generated wrapper script that sets (or
+  unsets) the PRIME offload env vars and then execs the real binary. A
+  wrapper is used instead of prefixing Exec= directly with `env VAR=val ...`
+  because some launchers (e.g. Omarchy's own browser-open shortcut) only
+  look at the first whitespace-delimited token of Exec= to find the real
+  executable — with an `env ...` prefix that token is literally "env",
+  which such launchers then run with no command, not the app. Routing
+  through a wrapper keeps the first token a real, directly-executable
+  path. TryExec= is never touched, since the desktop spec requires it to
+  stay a bare executable path for existence checks.
 
 The default (no-arg) run only does cheap telemetry reads, safe to poll every
 few seconds. The full installed-app catalog (--list-apps) walks every
@@ -32,6 +38,7 @@ import sys
 import os
 import re
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -51,10 +58,13 @@ USER_APPLICATIONS_DIR = HOME / ".local" / "share" / "applications"
 SYSTEM_APPLICATIONS_DIR = Path("/usr/share/applications")
 APP_GPU_STATE_FILE = HOME / ".config" / "omarchy" / "gpu-switch" / "apps.json"
 APP_GPU_BACKUP_DIR = HOME / ".config" / "omarchy" / "gpu-switch" / "backups"
+APP_GPU_WRAPPER_DIR = HOME / ".config" / "omarchy" / "gpu-switch" / "wrappers"
 APP_GPU_MARKER = "# Written by the GPU Switch plugin — per-app GPU override\n"
 
-NVIDIA_EXEC_PREFIX = "env __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia __VK_LAYER_NV_optimus=NVIDIA_only "
-AMD_EXEC_PREFIX = "env -u __NV_PRIME_RENDER_OFFLOAD -u __GLX_VENDOR_LIBRARY_NAME -u __VK_LAYER_NV_optimus "
+# Standard XDG desktop-entry field codes — kept in place (appended after the
+# wrapper path) so launchers that do proper Exec= parsing still see them and
+# substitute file/url args in.
+FIELD_CODES = {"%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m"}
 
 
 def read_sysfs(path):
@@ -462,14 +472,78 @@ def get_pristine_desktop_content(basename):
     return source
 
 
-def rewrite_exec_lines(content, prefix):
+def env_lines_for_gpu(gpu):
+    if gpu == "nvidia":
+        return [
+            "export __NV_PRIME_RENDER_OFFLOAD=1",
+            "export __GLX_VENDOR_LIBRARY_NAME=nvidia",
+            "export __VK_LAYER_NV_optimus=NVIDIA_only",
+        ]
+    return [
+        "unset __NV_PRIME_RENDER_OFFLOAD",
+        "unset __GLX_VENDOR_LIBRARY_NAME",
+        "unset __VK_LAYER_NV_optimus",
+    ]
+
+
+def write_wrapper_script(path, env_lines, binary, static_args):
+    cmd = " ".join([shlex.quote(binary)] + [shlex.quote(a) for a in static_args] + ['"$@"'])
+    content = "\n".join([
+        "#!/bin/sh",
+        "# Written by the GPU Switch plugin — do not edit by hand",
+        *env_lines,
+        f"exec {cmd}",
+        "",
+    ])
+    path.write_text(content)
+    path.chmod(0o755)
+
+
+def remove_wrappers_for_basename(basename):
+    slug = slugify(Path(basename).stem)
+    for f in APP_GPU_WRAPPER_DIR.glob(f"{slug}-*.sh"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def rewrite_exec_lines(content, basename, gpu):
+    """Point every Exec= line at a generated wrapper script instead of
+    prefixing it with `env VAR=val ...` directly — see the module docstring
+    for why. field codes (%U etc.) stay in Exec= itself, after the wrapper
+    path, so spec-compliant launchers still substitute args into them."""
+    env_lines = env_lines_for_gpu(gpu)
+    slug = slugify(Path(basename).stem)
+    APP_GPU_WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
+
     out_lines = []
+    exec_index = 0
     for line in content.splitlines(keepends=True):
         stripped = line.rstrip("\n")
         if stripped.startswith("Exec="):
             value = stripped[len("Exec="):]
             newline = "\n" if line.endswith("\n") else ""
-            out_lines.append(f"Exec={prefix}{value}{newline}")
+            try:
+                tokens = shlex.split(value, posix=True)
+            except ValueError:
+                tokens = value.split()
+
+            if not tokens:
+                out_lines.append(line)
+                continue
+
+            binary = tokens[0]
+            rest = tokens[1:]
+            static_args = [t for t in rest if t not in FIELD_CODES]
+            field_codes = [t for t in rest if t in FIELD_CODES]
+
+            wrapper_path = APP_GPU_WRAPPER_DIR / f"{slug}-{exec_index}.sh"
+            write_wrapper_script(wrapper_path, env_lines, binary, static_args)
+            exec_index += 1
+
+            new_value = " ".join([shlex.quote(str(wrapper_path))] + field_codes)
+            out_lines.append(f"Exec={new_value}{newline}")
         else:
             out_lines.append(line)
     return "".join(out_lines)
@@ -498,6 +572,7 @@ def apply_desktop_gpu(basename, gpu):
                 user_path.write_text(pristine)
             except OSError as e:
                 return {"status": "error", "message": str(e), "file": basename}
+        remove_wrappers_for_basename(basename)
         return {"status": "success", "file": basename, "gpu": "auto"}
 
     if gpu not in ("amd", "nvidia"):
@@ -507,8 +582,7 @@ def apply_desktop_gpu(basename, gpu):
     if pristine is None:
         return {"status": "error", "message": f"{basename} not found", "file": basename}
 
-    prefix = NVIDIA_EXEC_PREFIX if gpu == "nvidia" else AMD_EXEC_PREFIX
-    rewritten = APP_GPU_MARKER + rewrite_exec_lines(pristine, prefix)
+    rewritten = APP_GPU_MARKER + rewrite_exec_lines(pristine, basename, gpu)
 
     try:
         USER_APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
