@@ -4,17 +4,24 @@
   <img src="assets/gpu-selecta-icon.svg" width="128" height="96" alt="GPU Selecta icon">
 </p>
 
-An [Omarchy](https://omarchy.org/) shell plugin for hybrid AMD/NVIDIA (or Intel/NVIDIA)
-laptops: live telemetry for every GPU, a global default-renderer toggle, and
-per-app GPU pinning via PRIME render offload — plus basic power/fan controls
-where the hardware actually supports them.
+GPU Selecta is an [Omarchy](https://omarchy.org/) dashboard for Linux systems
+with multiple GPUs. It discovers each GPU by model, shows live telemetry, and
+exposes the power and fan controls supported by the hardware. On compatible
+hybrid systems, it can also choose the default renderer globally or pin
+individual applications to a GPU.
+
+Renderer switching uses stable PCI addresses with Mesa's `DRI_PRIME` support
+for AMD, Intel, and Nouveau GPUs. Proprietary NVIDIA GPUs use NVIDIA PRIME
+render offload. Other detected GPUs still appear in the dashboard, but GPU
+Selecta will not offer routing controls when the installed driver cannot
+select them safely.
 
 ## What this is (and isn't)
 
-On a muxless hybrid laptop, there's no hardware switch between GPUs — the
-discrete GPU has no display path of its own, so the integrated GPU always
-drives the screen. **This plugin does not change that.** What the routing
-features control is which GPU newly-launched *apps* render on:
+GPU Selecta is a renderer selector and monitoring dashboard, not a hardware
+GPU mux. On a muxless hybrid laptop, the integrated GPU continues to drive
+the display. The routing features choose which GPU newly launched *apps*
+render on:
 
 - **Global toggle**: sets PRIME offload environment variables for the whole
   session, applied live via Omarchy's Hyprland toggle mechanism — no restart

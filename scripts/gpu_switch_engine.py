@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-GPU Switch Engine
-Global default-renderer toggle, live telemetry, and per-app GPU pinning for
-hybrid AMD/NVIDIA (and Intel) laptops, via PRIME render offload.
+GPU Selecta Engine
+Global default-renderer selection, live telemetry, and per-app GPU pinning
+for multi-GPU Linux systems via Mesa or NVIDIA PRIME render offload.
 
 This is NOT a hardware GPU mux — muxless Optimus-style laptops have no
 display path from the discrete GPU, so the panel-owning GPU never changes.
@@ -46,13 +46,7 @@ HOME = Path.home()
 
 RENDER_TOGGLE_DIR = HOME / ".local" / "state" / "omarchy" / "toggles" / "hypr"
 RENDER_TOGGLE_FILE = RENDER_TOGGLE_DIR / "gpu-switch-render-default.lua"
-RENDER_TOGGLE_CONTENT = (
-    '-- Written by the GPU Switch plugin. Delete this file (or toggle it off\n'
-    '-- in the panel) to go back to the default GPU for new app launches.\n'
-    'hl.env("__NV_PRIME_RENDER_OFFLOAD", "1")\n'
-    'hl.env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")\n'
-    'hl.env("__VK_LAYER_NV_optimus", "NVIDIA_only")\n'
-)
+RENDER_TARGET_MARKER = "-- gpu-selecta-target: "
 
 USER_APPLICATIONS_DIR = HOME / ".local" / "share" / "applications"
 SYSTEM_APPLICATIONS_DIR = Path("/usr/share/applications")
@@ -106,9 +100,8 @@ def compact_gpu_name(display_name, vendor):
 def add_gpu_identity(gpus):
     """Add display names, optional roles, and safe routing keys.
 
-    PRIME routing currently supports one non-NVIDIA display GPU plus one
-    NVIDIA offload GPU. Other detected GPUs remain visible for telemetry but
-    are not presented as routable targets.
+    The boot VGA is the default path. Mesa GPUs use PCI-addressed DRI_PRIME;
+    one proprietary NVIDIA GPU uses NVIDIA PRIME render offload variables.
     """
     for index, gpu in enumerate(gpus):
         gpu["displayName"] = friendly_gpu_name(gpu.get("vendor", "Generic"), gpu.get("model"), index)
@@ -116,23 +109,24 @@ def add_gpu_identity(gpus):
         gpu["role"] = None
         gpu["routeKey"] = None
 
-    nvidia = [gpu for gpu in gpus if gpu.get("vendor") == "NVIDIA"]
-    non_nvidia = [gpu for gpu in gpus if gpu.get("vendor") != "NVIDIA"]
-    if len(nvidia) != 1 or not non_nvidia:
+    if not gpus:
         return gpus
 
-    primary_candidates = [gpu for gpu in non_nvidia if gpu.get("bootVga")]
-    if len(primary_candidates) == 1:
-        integrated = primary_candidates[0]
-    elif len(non_nvidia) == 1:
-        integrated = non_nvidia[0]
-    else:
-        return gpus
+    primary_candidates = [gpu for gpu in gpus if gpu.get("bootVga")]
+    primary = primary_candidates[0] if len(primary_candidates) == 1 else gpus[0]
+    primary["role"] = "Integrated" if len(gpus) > 1 and primary.get("vendor") in ("AMD", "Intel") else "Primary"
+    primary["routeKey"] = "amd"  # Legacy key retained: means system/default GPU.
 
-    integrated["role"] = "Integrated"
-    integrated["routeKey"] = "amd"  # Legacy persisted key: means non-NVIDIA/default path.
-    nvidia[0]["role"] = "Discrete"
-    nvidia[0]["routeKey"] = "nvidia"
+    proprietary_nvidia = [gpu for gpu in gpus if gpu.get("driver") == "nvidia"]
+    mesa_drivers = {"amdgpu", "radeon", "i915", "xe", "nouveau"}
+    for gpu in gpus:
+        if gpu is primary:
+            continue
+        gpu["role"] = "Discrete"
+        if gpu.get("driver") == "nvidia" and len(proprietary_nvidia) == 1:
+            gpu["routeKey"] = "nvidia"  # Legacy key retained for saved overrides.
+        elif gpu.get("driver") in mesa_drivers and gpu.get("driPrime"):
+            gpu["routeKey"] = f"dri:{gpu['driPrime']}"
     return gpus
 
 
@@ -150,6 +144,7 @@ def scan_gpu_telemetry():
 
         vendor_id = read_sysfs(dev_path / "vendor") or ""
         device_id = read_sysfs(dev_path / "device") or "Unknown"
+        pci_addr = dev_path.resolve().name
         driver_link = dev_path / "driver"
         driver = driver_link.resolve().name if driver_link.exists() else "unknown"
         boot_vga = read_sysfs(dev_path / "boot_vga") == "1"
@@ -164,7 +159,6 @@ def scan_gpu_telemetry():
 
         model = f"Graphics ({device_id})"
         try:
-            pci_addr = dev_path.resolve().name
             # A runtime-suspended GPU (common for the idle discrete GPU on a
             # hybrid laptop) takes a moment to wake when its PCI config space
             # is read — give lspci real headroom rather than a tight timeout
@@ -223,6 +217,8 @@ def scan_gpu_telemetry():
             "model": model,
             "driver": driver,
             "bootVga": boot_vga,
+            "pciAddress": pci_addr,
+            "driPrime": "pci-" + re.sub(r"[:.]", "_", pci_addr),
             "tempC": temp_c,
             "vramUsedMb": vram_used_mb if vram_total_mb > 0 else None,
             "vramTotalMb": vram_total_mb if vram_total_mb > 0 else None,
@@ -274,6 +270,7 @@ def scan_gpu_telemetry():
             gpus.append({
                 "id": f"nvidia{i}", "vendor": "NVIDIA", "model": model_name, "driver": "nvidia",
                 "bootVga": False,
+                "pciAddress": None, "driPrime": None,
                 "supportsTuning": False, "performanceLevel": None,
                 "supportsFanControl": False, "fanMode": None,
                 **telemetry,
@@ -283,17 +280,42 @@ def scan_gpu_telemetry():
 
 
 def get_render_default():
-    return "nvidia" if RENDER_TOGGLE_FILE.exists() else "amd"
+    if not RENDER_TOGGLE_FILE.exists():
+        return "amd"
+    try:
+        for line in RENDER_TOGGLE_FILE.read_text().splitlines():
+            if line.startswith(RENDER_TARGET_MARKER):
+                return line[len(RENDER_TARGET_MARKER):].strip()
+    except OSError:
+        pass
+    return "nvidia"  # Compatibility with files written before target markers.
+
+
+def is_route_target(target):
+    return target in ("amd", "nvidia") or bool(re.fullmatch(r"dri:pci-[0-9a-fA-F_]+", target))
+
+
+def render_toggle_content(target):
+    values = env_values_for_gpu(target)
+    lines = [
+        "-- Written by the GPU Selecta plugin. Delete this file to use the system-default GPU.",
+        f"{RENDER_TARGET_MARKER}{target}",
+    ]
+    for name, value in values.items():
+        lines.append(f'hl.env("{name}", "{value}")')
+    return "\n".join(lines) + "\n"
 
 
 def set_render_default(target):
-    if target not in ("amd", "nvidia"):
+    gpus = scan_gpu_telemetry()
+    available = {gpu["routeKey"] for gpu in gpus if gpu.get("routeKey")}
+    if not is_route_target(target) or target not in available:
         return {"status": "error", "message": f"Invalid render default: {target}"}
 
     try:
-        if target == "nvidia":
+        if target != "amd":
             RENDER_TOGGLE_DIR.mkdir(parents=True, exist_ok=True)
-            RENDER_TOGGLE_FILE.write_text(RENDER_TOGGLE_CONTENT)
+            RENDER_TOGGLE_FILE.write_text(render_toggle_content(target))
         else:
             RENDER_TOGGLE_FILE.unlink(missing_ok=True)
     except OSError as e:
@@ -534,18 +556,29 @@ def get_pristine_desktop_content(basename):
     return source
 
 
-def env_lines_for_gpu(gpu):
+def env_values_for_gpu(gpu):
+    values = {
+        "DRI_PRIME": "",
+        "__NV_PRIME_RENDER_OFFLOAD": "",
+        "__GLX_VENDOR_LIBRARY_NAME": "",
+        "__VK_LAYER_NV_optimus": "",
+    }
     if gpu == "nvidia":
-        return [
-            "export __NV_PRIME_RENDER_OFFLOAD=1",
-            "export __GLX_VENDOR_LIBRARY_NAME=nvidia",
-            "export __VK_LAYER_NV_optimus=NVIDIA_only",
-        ]
-    return [
-        "unset __NV_PRIME_RENDER_OFFLOAD",
-        "unset __GLX_VENDOR_LIBRARY_NAME",
-        "unset __VK_LAYER_NV_optimus",
-    ]
+        values.update({
+            "__NV_PRIME_RENDER_OFFLOAD": "1",
+            "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
+            "__VK_LAYER_NV_optimus": "NVIDIA_only",
+        })
+    elif gpu.startswith("dri:"):
+        values["DRI_PRIME"] = gpu[len("dri:"):]
+    return values
+
+
+def env_lines_for_gpu(gpu):
+    lines = []
+    for name, value in env_values_for_gpu(gpu).items():
+        lines.append(f"export {name}={shlex.quote(value)}" if value else f"unset {name}")
+    return lines
 
 
 def write_wrapper_script(path, env_lines, binary, static_args):
@@ -637,7 +670,7 @@ def apply_desktop_gpu(basename, gpu):
         remove_wrappers_for_basename(basename)
         return {"status": "success", "file": basename, "gpu": "auto"}
 
-    if gpu not in ("amd", "nvidia"):
+    if not is_route_target(gpu):
         return {"status": "error", "message": f"Invalid GPU target: {gpu}", "file": basename}
 
     pristine = get_pristine_desktop_content(basename)
@@ -659,7 +692,7 @@ def set_app_gpu(app_key, gpu, label=None, desktop_files=None):
     """Apply a GPU choice to an app. If the app isn't already known (e.g. a
     fresh key from the auto-discovered catalog that's never been saved
     before), label/desktop_files must be supplied so we know what to write."""
-    if gpu not in ("amd", "nvidia", "auto"):
+    if gpu != "auto" and not is_route_target(gpu):
         return {"status": "error", "message": f"Invalid GPU target: {gpu}"}
 
     overrides = load_saved_overrides()
@@ -709,12 +742,16 @@ def main():
 
     gpus = scan_gpu_telemetry()
     route_keys = {g["routeKey"] for g in gpus if g.get("routeKey")}
-    is_hybrid = {"amd", "nvidia"}.issubset(route_keys)
+    is_hybrid = "amd" in route_keys and len(route_keys) > 1
+
+    render_default = get_render_default()
+    if render_default not in route_keys:
+        render_default = "amd"
 
     output = {
         "gpus": gpus,
         "isHybrid": is_hybrid,
-        "renderDefault": get_render_default(),
+        "renderDefault": render_default,
     }
     print(json.dumps(output, indent=2))
 

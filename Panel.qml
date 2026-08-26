@@ -34,7 +34,7 @@ Panel {
   property bool appsLoaded: false
   property bool appsLoading: false
   property string appFilter: ""
-  property var expandedGpus: ({})
+  property string expandedGpuId: ""
 
   readonly property var tabList: [
     { label: "Overview", key: "overview" },
@@ -106,6 +106,49 @@ Panel {
     return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
+  readonly property var clickSoundPaths: [
+    Qt.resolvedUrl("assets/scratch1.mp3").toString().replace(/^file:\/\//, ""),
+    Qt.resolvedUrl("assets/scratch2.mp3").toString().replace(/^file:\/\//, ""),
+    Qt.resolvedUrl("assets/scratch3.mp3").toString().replace(/^file:\/\//, "")
+  ]
+  property int clickSoundIndex: 0
+
+  function shellQuote(str) {
+    return "'" + String(str).replace(/'/g, "'\\''") + "'"
+  }
+
+  property bool soundMuted: false
+
+  function playButtonSound() {
+    if (!root.bar) return
+    var path = root.clickSoundPaths[root.clickSoundIndex]
+    root.clickSoundIndex = (root.clickSoundIndex + 1) % root.clickSoundPaths.length
+    if (!root.soundMuted) {
+      root.bar.run("mpv --no-video --really-quiet " + root.shellQuote(path))
+    }
+    root.playScratchGif()
+  }
+
+  // Ping-pong: forward click plays the scratch gif start→end via
+  // AnimatedImage's native playback; reverse click steps currentFrame
+  // end→start by hand on a Timer, since QMovie/AnimatedImage has no native
+  // reverse-playback mode. Outside of those two, "idle" loops one of two
+  // calmer gifs: scratch-idle before the first click and after every reverse
+  // (2nd, 4th, ... press) finishes; scratch-idle2 after every forward
+  // (1st, 3rd, ... press) finishes.
+  readonly property url scratchGifSourceIdle: Qt.resolvedUrl("assets/scratch-idle.gif")
+  readonly property url scratchGifSourceIdle2: Qt.resolvedUrl("assets/scratch-idle2.gif")
+  readonly property url scratchGifSourceActive: Qt.resolvedUrl("assets/scratch.gif")
+  property string scratchGifMode: "idle" // "idle" | "forward" | "reverse"
+  property int scratchGifIdleVariant: 1 // 1 = scratch-idle, 2 = scratch-idle2
+  property bool scratchGifForwardNext: true
+
+  function playScratchGif() {
+    if (root.scratchGifMode !== "idle") return
+    root.scratchGifMode = root.scratchGifForwardNext ? "forward" : "reverse"
+    root.scratchGifForwardNext = !root.scratchGifForwardNext
+  }
+
   // GPU model strings look like "GA106M [GeForce RTX 3060 Mobile / Max-Q] (rev a1)"
   // — the bit between "[" and "/" is the actual marketing name and the part
   // worth drawing the eye to; the chip codename and revision are noise.
@@ -147,9 +190,7 @@ Panel {
   }
 
   function toggleGpuManage(gpuId) {
-    var updated = Object.assign({}, root.expandedGpus)
-    updated[gpuId] = !updated[gpuId]
-    root.expandedGpus = updated
+    root.expandedGpuId = (root.expandedGpuId === gpuId) ? "" : gpuId
   }
 
   function setPowerProfile(gpuId, level) {
@@ -314,80 +355,196 @@ Panel {
         anchors.top: parent.top
         spacing: Style.space(10)
 
-        // ------------------ HERO HEADER ------------------
+        // ------------------ HERO HEADER + SCRATCH GIF ------------------
+        // Gif pinned top-right, shown at its native 200x133 size.
         Item {
           width: parent.width
-          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
+          implicitHeight: Math.max(scratchGifImage.height, headerLeft.implicitHeight + Style.space(10) + tabsRow.implicitHeight)
+
+          AnimatedImage {
+            id: scratchGifImage
+            anchors.top: parent.top
+            anchors.right: parent.right
+            width: 200
+            height: 133
+            fillMode: Image.PreserveAspectFit
+            source: {
+              if (root.scratchGifMode === "forward" || root.scratchGifMode === "reverse") return root.scratchGifSourceActive
+              return root.scratchGifIdleVariant === 2 ? root.scratchGifSourceIdle2 : root.scratchGifSourceIdle
+            }
+            playing: root.scratchGifMode === "idle" || root.scratchGifMode === "forward"
+            speed: root.scratchGifMode === "forward" ? 2.0 : 0.5
+            cache: true
+
+            onStatusChanged: {
+              if (status !== Image.Ready) return
+              if (root.scratchGifMode === "forward") {
+                currentFrame = 0
+              } else if (root.scratchGifMode === "reverse") {
+                currentFrame = frameCount - 1
+                scratchGifReverseTimer.start()
+              }
+            }
+
+            onCurrentFrameChanged: {
+              if (root.scratchGifMode !== "forward" || !playing) return
+              if (currentFrame >= frameCount - 1) {
+                root.scratchGifIdleVariant = 2
+                root.scratchGifMode = "idle"
+              }
+            }
+          }
+
+          // Manual reverse stepper for the scratch gif. Its native per-frame
+          // delay is 80ms; halved to 40ms to match the forward pass's 2x speed.
+          Timer {
+            id: scratchGifReverseTimer
+            interval: 40
+            repeat: true
+            running: false
+            onTriggered: {
+              if (root.scratchGifMode !== "reverse") {
+                scratchGifReverseTimer.stop()
+                return
+              }
+              if (scratchGifImage.currentFrame <= 0) {
+                scratchGifReverseTimer.stop()
+                root.scratchGifIdleVariant = 1
+                root.scratchGifMode = "idle"
+                return
+              }
+              scratchGifImage.currentFrame -= 1
+            }
+          }
 
           Item {
-            id: heroIcon
+            id: headerLeft
+            anchors.top: parent.top
             anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            implicitWidth: 32
-            implicitHeight: 24
+            anchors.right: scratchGifImage.left
+            anchors.rightMargin: Style.space(12)
+            implicitHeight: heroTopRow.implicitHeight + Style.space(8) + heroButtonRow.implicitHeight
 
-            Image {
-              id: heroIconImage
-              anchors.fill: parent
-              source: Qt.resolvedUrl("assets/gpu-selecta-icon.svg")
-              sourceSize.width: Math.round(width * Screen.devicePixelRatio)
-              sourceSize.height: Math.round(height * Screen.devicePixelRatio)
-              fillMode: Image.PreserveAspectFit
-              visible: false
-              layer.enabled: true
+            Item {
+              id: heroTopRow
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
+
+              Item {
+                id: heroIcon
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                implicitWidth: 32
+                implicitHeight: 24
+
+                Image {
+                  id: heroIconImage
+                  anchors.fill: parent
+                  source: Qt.resolvedUrl("assets/gpu-selecta-icon.svg")
+                  sourceSize.width: Math.round(width * Screen.devicePixelRatio)
+                  sourceSize.height: Math.round(height * Screen.devicePixelRatio)
+                  fillMode: Image.PreserveAspectFit
+                  visible: false
+                  layer.enabled: true
+                }
+
+                MultiEffect {
+                  anchors.fill: heroIconImage
+                  source: heroIconImage
+                  colorization: 1.0
+                  colorizationColor: root.renderDefault === "nvidia" ? Color.accent : root.foreground
+                }
+              }
+
+              Column {
+                id: heroLabels
+                anchors.left: heroIcon.right
+                anchors.leftMargin: Style.space(12)
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "GPU Selecta"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Spin your GPUs your way!"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
             }
 
-            MultiEffect {
-              anchors.fill: heroIconImage
-              source: heroIconImage
-              colorization: 1.0
-              colorizationColor: root.renderDefault === "nvidia" ? Color.accent : root.foreground
+            Row {
+              id: heroButtonRow
+              anchors.top: heroTopRow.bottom
+              anchors.topMargin: Style.space(8)
+              anchors.right: parent.right
+              spacing: Style.space(4)
+
+              PanelActionButton {
+                id: heroMuteAction
+                iconText: root.soundMuted ? "" : ""
+                tooltipText: root.soundMuted ? "Unmute button sounds" : "Mute button sounds"
+                foreground: root.soundMuted ? root.dim : root.foreground
+                onClicked: root.soundMuted = !root.soundMuted
+              }
             }
           }
 
-          Column {
-            id: heroLabels
-            anchors.left: heroIcon.right
-            anchors.leftMargin: Style.space(12)
-            anchors.right: heroAction.left
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(2)
+          // ------------------ NAVIGATION TABS ------------------
+          // Flows below the logo/title/mute block, left of the gif, so the
+          // tabs share the header's vertical space instead of adding a row.
+          Row {
+            id: tabsRow
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: scratchGifImage.left
+            anchors.rightMargin: Style.space(12)
+            spacing: Style.space(6)
 
-            Text {
-              textFormat: Text.PlainText
-              text: "GPU Selecta"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-            }
+            Repeater {
+              model: root.tabList
+              delegate: BorderSurface {
+                readonly property bool isSelected: root.activeTab === modelData.key
+                implicitWidth: tabText.implicitWidth + Style.space(14)
+                implicitHeight: tabText.implicitHeight + Style.space(8)
+                radius: Style.cornerRadius
+                color: isSelected ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
+                borderSpec: isSelected
+                  ? Border.controlSpec("selected", Color.accent, Color.accent)
+                  : Border.controlSpec("normal", root.dim, Color.accent)
 
-            Text {
-              textFormat: Text.PlainText
-              text: "Spin your GPUs your way!"
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
+                Text {
+                  textFormat: Text.PlainText
+                  id: tabText
+                  anchors.centerIn: parent
+                  text: modelData.label
+                  color: isSelected ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: isSelected
+                }
 
-          PanelActionButton {
-            id: heroAction
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            iconText: ""
-            tooltipText: root.isUpdating ? "Refreshing..." : "Refresh ('R')"
-            foreground: root.isUpdating ? Color.accent : root.foreground
-            rotation: 0
-            onClicked: root.refresh()
-
-            RotationAnimation on rotation {
-              from: 0
-              to: 360
-              duration: 800
-              loops: Animation.Infinite
-              running: root.isUpdating
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.activeTab = modelData.key
+                    if (modelData.key === "apps" && !root.appsLoaded) root.loadApps()
+                  }
+                }
+              }
             }
           }
         }
@@ -414,46 +571,6 @@ Panel {
           }
         }
 
-        // ------------------ NAVIGATION TABS ------------------
-        Row {
-          width: parent.width
-          spacing: Style.space(6)
-
-          Repeater {
-            model: root.tabList
-            delegate: BorderSurface {
-              readonly property bool isSelected: root.activeTab === modelData.key
-              implicitWidth: tabText.implicitWidth + Style.space(14)
-              implicitHeight: tabText.implicitHeight + Style.space(8)
-              radius: Style.cornerRadius
-              color: isSelected ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
-              borderSpec: isSelected
-                ? Border.controlSpec("selected", Color.accent, Color.accent)
-                : Border.controlSpec("normal", root.dim, Color.accent)
-
-              Text {
-                textFormat: Text.PlainText
-                id: tabText
-                anchors.centerIn: parent
-                text: modelData.label
-                color: isSelected ? root.foreground : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: isSelected
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.activeTab = modelData.key
-                  if (modelData.key === "apps" && !root.appsLoaded) root.loadApps()
-                }
-              }
-            }
-          }
-        }
-
         PanelSeparator {
           width: parent.width
         }
@@ -470,7 +587,7 @@ Panel {
             visible: !root.isHybrid
             textFormat: Text.PlainText
             width: parent.width
-            text: "This system doesn't have a hybrid AMD/NVIDIA (or Intel/NVIDIA) setup with more than one GPU, so there's nothing to route between."
+            text: "No additional GPU can be selected safely with the installed drivers. Detected GPUs remain available below for telemetry."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -496,7 +613,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: "Global Default"
+                text: "Select Global Default"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -548,7 +665,10 @@ Panel {
                     MouseArea {
                       anchors.fill: parent
                       cursorShape: Qt.PointingHandCursor
-                      onClicked: root.setRenderDefault(modelData.key)
+                      onClicked: {
+                        root.playButtonSound()
+                        root.setRenderDefault(modelData.key)
+                      }
                     }
                   }
                 }
@@ -572,7 +692,7 @@ Panel {
 
             delegate: BorderSurface {
               readonly property var gpu: modelData
-              readonly property bool expanded: Boolean(root.expandedGpus[gpu.id])
+              readonly property bool expanded: root.expandedGpuId === gpu.id
               width: parent.width
               implicitHeight: gpuCardCol.implicitHeight + Style.space(14)
               color: Style.hoverFillFor(root.foreground, root.foreground)
@@ -1022,7 +1142,10 @@ Panel {
                             MouseArea {
                               anchors.fill: parent
                               cursorShape: Qt.PointingHandCursor
-                              onClicked: root.setAppGpu(appKey, modelData.key)
+                              onClicked: {
+                                root.playButtonSound()
+                                root.setAppGpu(appKey, modelData.key)
+                              }
                             }
                           }
                         }
