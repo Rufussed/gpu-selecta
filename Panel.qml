@@ -965,16 +965,47 @@ Panel {
               anchors.right: parent.right
               anchors.top: parent.top
               anchors.bottom: parent.bottom
-              width: Style.space(6)
+              width: Style.space(10)
               radius: width / 2
               color: Qt.darker(root.foreground, 4)
 
               Rectangle {
+                id: appsScrollThumb
                 width: parent.width
                 radius: width / 2
-                color: root.dim
+                color: scrollDragArea.pressed ? root.foreground : root.dim
                 y: appsFlick.visibleArea.yPosition * appsScrollTrack.height
                 height: Math.max(Style.space(16), appsFlick.visibleArea.heightRatio * appsScrollTrack.height)
+              }
+
+              MouseArea {
+                id: scrollDragArea
+                anchors.fill: parent
+                property real dragStartMouseY: 0
+                property real dragStartContentY: 0
+
+                function scrollableHeight() {
+                  return Math.max(0, appsFlick.contentHeight - appsFlick.height)
+                }
+
+                onPressed: (mouse) => {
+                  var trackRange = appsScrollTrack.height - appsScrollThumb.height
+                  var clickedOutsideThumb = mouse.y < appsScrollThumb.y || mouse.y > appsScrollThumb.y + appsScrollThumb.height
+                  if (clickedOutsideThumb && trackRange > 0) {
+                    var ratio = Math.max(0, Math.min(1, (mouse.y - appsScrollThumb.height / 2) / trackRange))
+                    appsFlick.contentY = ratio * scrollDragArea.scrollableHeight()
+                  }
+                  dragStartMouseY = mouse.y
+                  dragStartContentY = appsFlick.contentY
+                }
+
+                onPositionChanged: (mouse) => {
+                  if (!pressed) return
+                  var trackRange = appsScrollTrack.height - appsScrollThumb.height
+                  if (trackRange <= 0) return
+                  var deltaContent = (mouse.y - dragStartMouseY) * scrollDragArea.scrollableHeight() / trackRange
+                  appsFlick.contentY = Math.max(0, Math.min(scrollDragArea.scrollableHeight(), dragStartContentY + deltaContent))
+                }
               }
             }
           }
