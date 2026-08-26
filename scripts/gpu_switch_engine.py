@@ -71,6 +71,14 @@ def read_sysfs(path):
     return None
 
 
+def _is_number(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
 def friendly_gpu_name(vendor, model, index):
     """Return a compact, user-facing identity without relying on card order."""
     model = (model or "").strip()
@@ -187,6 +195,7 @@ def scan_gpu_telemetry():
 
         temp_c = None
         power_w = None
+        power_limit_w = None
         fan_mode = None
         supports_fan_control = False
         hwmon_dirs = list(dev_path.glob("hwmon/hwmon*"))
@@ -198,6 +207,9 @@ def scan_gpu_telemetry():
             p = read_sysfs(hdir / "power1_average") or read_sysfs(hdir / "power1_input")
             if p and p.isdigit():
                 power_w = round(int(p) / 1000000.0, 1)
+            cap = read_sysfs(hdir / "power1_cap")
+            if cap and cap.isdigit():
+                power_limit_w = round(int(cap) / 1000000.0, 1)
             # A hwmon directory existing doesn't mean fan control exists —
             # iGPUs/APUs publish temp/power sensors but no pwm1 node, since
             # the fan is wired to the system EC rather than the GPU.
@@ -225,6 +237,7 @@ def scan_gpu_telemetry():
             "vramPercent": vram_percent,
             "busyPercent": busy_percent,
             "powerWatts": power_w,
+            "powerLimitWatts": power_limit_w,
             "supportsTuning": supports_tuning,
             "performanceLevel": performance_level,
             "supportsFanControl": supports_fan_control,
@@ -240,7 +253,7 @@ def scan_gpu_telemetry():
     nvidia_rows = []
     try:
         res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=gpu_name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw",
+            ["nvidia-smi", "--query-gpu=gpu_name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=1.0)
         if res.returncode == 0:
@@ -261,7 +274,8 @@ def scan_gpu_telemetry():
             "vramTotalMb": vram_total,
             "vramPercent": round((vram_used / vram_total) * 100, 1) if vram_total > 0 else None,
             "busyPercent": int(parts[3]) if parts[3].isdigit() else None,
-            "powerWatts": float(parts[5]) if len(parts) > 5 else None,
+            "powerWatts": float(parts[5]) if len(parts) > 5 and _is_number(parts[5]) else None,
+            "powerLimitWatts": float(parts[6]) if len(parts) > 6 and _is_number(parts[6]) else None,
         }
         if i < len(nvidia_entries):
             nvidia_entries[i].update(telemetry)

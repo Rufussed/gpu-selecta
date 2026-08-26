@@ -149,6 +149,39 @@ Panel {
     root.scratchGifForwardNext = !root.scratchGifForwardNext
   }
 
+  // Shared 0..1 gauge for the telemetry bars: green at the low end of the
+  // given range, red at the high end, same threshold bands the VRAM bar
+  // already used (green <70%, accent 70-89%, urgent >=90%).
+  function gaugeRatio(value, min, max) {
+    if (value === null || value === undefined) return 0
+    return Math.max(0, Math.min(1, (value - min) / (max - min)))
+  }
+
+  function gaugeColor(ratio) {
+    var pct = ratio * 100
+    return pct >= 90 ? root.urgent : (pct >= 70 ? Color.accent : "#87c095")
+  }
+
+  // Temp gauge range: ~40°C is a GPU sitting comfortably idle, ~90°C is
+  // where laptop GPUs (AMD and NVIDIA alike) start thermal-throttling —
+  // so this maps roughly to "cold" -> "throttle risk".
+  readonly property real tempGaugeMin: 40
+  readonly property real tempGaugeMax: 90
+
+  // Power gauge range: prefer the GPU's own reported cap (power1_cap on
+  // amdgpu, power.limit on nvidia-smi) when the driver exposes one. Most
+  // laptop hybrid setups don't (this iGPU has no power1_cap node at all;
+  // nvidia-smi reports power.limit as N/A outside persistence mode), so
+  // fall back to a role-based guess: ~35W ceiling for the GPU that's
+  // actually driving the display (bootVga, almost always the integrated
+  // one), ~150W for a discrete GPU — typical laptop dGPU TBP territory.
+  function powerGaugeMax(gpu) {
+    if (gpu.powerLimitWatts !== null && gpu.powerLimitWatts !== undefined && gpu.powerLimitWatts > 0) {
+      return gpu.powerLimitWatts
+    }
+    return gpu.bootVga ? 35 : 150
+  }
+
   // GPU model strings look like "GA106M [GeForce RTX 3060 Mobile / Max-Q] (rev a1)"
   // — the bit between "[" and "/" is the actual marketing name and the part
   // worth drawing the eye to; the chip codename and revision are noise.
@@ -784,58 +817,129 @@ Panel {
                   }
                 }
 
-                Row {
-                  spacing: Style.space(14)
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: (gpu.tempC !== null && gpu.tempC !== undefined) ? Math.round(gpu.tempC) + "°C" : "— °C"
-                    color: (gpu.tempC !== null && gpu.tempC >= 80) ? root.urgent : root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: (gpu.busyPercent !== null && gpu.busyPercent !== undefined) ? gpu.busyPercent + "% busy" : "— busy"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: (gpu.powerWatts !== null && gpu.powerWatts !== undefined) ? gpu.powerWatts + " W" : "— W"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-
-                Rectangle {
-                  id: vramBarTrack
-                  visible: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined
+                // Temp gauge
+                Column {
                   width: parent.width
-                  height: Style.space(6)
-                  radius: height / 2
-                  color: Qt.darker(root.foreground, 4)
+                  spacing: Style.space(2)
+                  visible: gpu.tempC !== null && gpu.tempC !== undefined
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Temp: " + Math.round(gpu.tempC) + "°C"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
 
                   Rectangle {
-                    width: vramBarTrack.width * Math.max(0, Math.min(1, (gpu.vramPercent || 0) / 100))
-                    height: parent.height
+                    id: tempBarTrack
+                    width: parent.width
+                    height: Style.space(6)
                     radius: height / 2
-                    color: (gpu.vramPercent || 0) >= 90 ? root.urgent : ((gpu.vramPercent || 0) >= 70 ? Color.accent : "#87c095")
+                    color: Qt.darker(root.foreground, 4)
+
+                    Rectangle {
+                      readonly property real ratio: root.gaugeRatio(gpu.tempC, root.tempGaugeMin, root.tempGaugeMax)
+                      width: tempBarTrack.width * ratio
+                      height: parent.height
+                      radius: height / 2
+                      color: root.gaugeColor(ratio)
+                    }
                   }
                 }
 
-                Text {
-                  textFormat: Text.PlainText
+                // Busy gauge
+                Column {
+                  width: parent.width
+                  spacing: Style.space(2)
+                  visible: gpu.busyPercent !== null && gpu.busyPercent !== undefined
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Busy: " + gpu.busyPercent + "%"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Rectangle {
+                    id: busyBarTrack
+                    width: parent.width
+                    height: Style.space(6)
+                    radius: height / 2
+                    color: Qt.darker(root.foreground, 4)
+
+                    Rectangle {
+                      readonly property real ratio: root.gaugeRatio(gpu.busyPercent, 0, 100)
+                      width: busyBarTrack.width * ratio
+                      height: parent.height
+                      radius: height / 2
+                      color: root.gaugeColor(ratio)
+                    }
+                  }
+                }
+
+                // Power gauge
+                Column {
+                  width: parent.width
+                  spacing: Style.space(2)
+                  visible: gpu.powerWatts !== null && gpu.powerWatts !== undefined
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Power: " + gpu.powerWatts + " W"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Rectangle {
+                    id: powerBarTrack
+                    width: parent.width
+                    height: Style.space(6)
+                    radius: height / 2
+                    color: Qt.darker(root.foreground, 4)
+
+                    Rectangle {
+                      readonly property real ratio: root.gaugeRatio(gpu.powerWatts, 0, root.powerGaugeMax(gpu))
+                      width: powerBarTrack.width * ratio
+                      height: parent.height
+                      radius: height / 2
+                      color: root.gaugeColor(ratio)
+                    }
+                  }
+                }
+
+                // VRAM gauge
+                Column {
+                  width: parent.width
+                  spacing: Style.space(2)
                   visible: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined
-                  text: Math.round(gpu.vramUsedMb || 0) + " / " + Math.round(gpu.vramTotalMb || 0) + " MB VRAM" +
-                        ((gpu.vramPercent !== null && gpu.vramPercent !== undefined) ? " (" + gpu.vramPercent + "%)" : "")
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Math.round(gpu.vramUsedMb || 0) + " / " + Math.round(gpu.vramTotalMb || 0) + " MB VRAM" +
+                          ((gpu.vramPercent !== null && gpu.vramPercent !== undefined) ? " (" + gpu.vramPercent + "%)" : "")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Rectangle {
+                    id: vramBarTrack
+                    width: parent.width
+                    height: Style.space(6)
+                    radius: height / 2
+                    color: Qt.darker(root.foreground, 4)
+
+                    Rectangle {
+                      readonly property real ratio: root.gaugeRatio(gpu.vramPercent, 0, 100)
+                      width: vramBarTrack.width * ratio
+                      height: parent.height
+                      radius: height / 2
+                      color: root.gaugeColor(ratio)
+                    }
+                  }
                 }
 
                 // ------------------ MANAGE (power governor + fan) ------------------
