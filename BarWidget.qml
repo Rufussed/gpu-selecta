@@ -60,14 +60,14 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: (panelLoader.item && panelLoader.item.renderDefault === "nvidia") ? "󰢮" : "󰢮"
+    text: "󰢮"
     foreground: (panelLoader.item && panelLoader.item.renderDefault === "nvidia")
       ? Color.accent
       : (root.bar ? root.bar.barForeground : Color.foreground)
     slotSize: Style.bar.statusSlot
     tooltipText: (panelLoader.item && panelLoader.item.renderDefault)
-      ? "GPU Switch: default is " + (panelLoader.item.renderDefault === "nvidia" ? "NVIDIA" : "AMD")
-      : "GPU Switch"
+      ? "GPU Selecta: default is " + panelLoader.item.routingLabel(panelLoader.item.renderDefault)
+      : "GPU Selecta"
 
     onPressed: function(b) {
       if (!root.bar) return

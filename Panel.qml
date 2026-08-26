@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -43,11 +44,44 @@ Panel {
   // "amd" is really "the non-NVIDIA GPU" in the render-default toggle — name
   // it after whichever vendor is actually integrated on this machine (AMD or
   // Intel) rather than assuming AMD.
-  readonly property string integratedVendor: {
+  readonly property var routingChoices: {
+    var choices = []
     for (var i = 0; i < root.gpus.length; i++) {
-      if (root.gpus[i].vendor !== "NVIDIA") return root.gpus[i].vendor
+      var gpu = root.gpus[i]
+      if (gpu.routeKey) {
+        choices.push({
+          key: gpu.routeKey,
+          label: gpu.shortName || gpu.displayName || ("GPU " + (i + 1)),
+          fullLabel: gpu.displayName || ("GPU " + (i + 1)),
+          role: gpu.role || ""
+        })
+      }
     }
-    return ""
+    choices.sort(function(a, b) {
+      var rank = { "Integrated": 0, "Discrete": 1 }
+      return (rank[a.role] !== undefined ? rank[a.role] : 2) -
+             (rank[b.role] !== undefined ? rank[b.role] : 2)
+    })
+    return choices
+  }
+
+  readonly property var appRoutingChoices: {
+    var choices = [{ key: "auto", label: "Default", role: "" }]
+    for (var i = 0; i < root.routingChoices.length; i++) {
+      choices.push({
+        key: root.routingChoices[i].key,
+        label: root.routingChoices[i].label,
+        role: ""
+      })
+    }
+    return choices
+  }
+
+  function routingLabel(key) {
+    for (var i = 0; i < root.routingChoices.length; i++) {
+      if (root.routingChoices[i].key === key) return root.routingChoices[i].fullLabel
+    }
+    return key
   }
 
   readonly property var filteredAppKeys: {
@@ -207,7 +241,7 @@ Panel {
             var res = JSON.parse(text)
             if (res.status === "success") {
               if (res.renderDefault) {
-                root.copiedNotice = "Default renderer: " + (res.renderDefault === "nvidia" ? "Discrete (NVIDIA)" : ("Integrated" + (root.integratedVendor ? " (" + root.integratedVendor + ")" : "")))
+                root.copiedNotice = "Default renderer: " + root.routingLabel(res.renderDefault)
               } else if (res.appKey && res.gpu) {
                 // The pill highlight already shows the new selection — no
                 // need for a redundant top-of-panel banner on every click.
@@ -285,15 +319,30 @@ Panel {
           width: parent.width
           implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
 
-          Text {
-            textFormat: Text.PlainText
+          Item {
             id: heroIcon
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
-            text: "󰢮"
-            color: root.renderDefault === "nvidia" ? Color.accent : root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.display
+            implicitWidth: 32
+            implicitHeight: 24
+
+            Image {
+              id: heroIconImage
+              anchors.fill: parent
+              source: Qt.resolvedUrl("assets/gpu-selecta-icon.svg")
+              sourceSize.width: Math.round(width * Screen.devicePixelRatio)
+              sourceSize.height: Math.round(height * Screen.devicePixelRatio)
+              fillMode: Image.PreserveAspectFit
+              visible: false
+              layer.enabled: true
+            }
+
+            MultiEffect {
+              anchors.fill: heroIconImage
+              source: heroIconImage
+              colorization: 1.0
+              colorizationColor: root.renderDefault === "nvidia" ? Color.accent : root.foreground
+            }
           }
 
           Column {
@@ -307,7 +356,7 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: "GPU Switch"
+              text: "GPU Selecta"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
@@ -316,7 +365,7 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: root.isHybrid ? "Hybrid GPU launch routing" : "No hybrid GPU setup detected"
+              text: "Spin your GPUs your way!"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -458,30 +507,42 @@ Panel {
                 spacing: Style.space(6)
 
                 Repeater {
-                  model: [
-                    { key: "amd", label: root.integratedVendor ? "Integrated (" + root.integratedVendor + ")" : "Integrated" },
-                    { key: "nvidia", label: "Discrete (NVIDIA)" }
-                  ]
+                  model: root.routingChoices
 
                   delegate: BorderSurface {
                     readonly property bool isActive: root.renderDefault === modelData.key
-                    implicitWidth: globalChoiceText.implicitWidth + Style.space(14)
-                    implicitHeight: globalChoiceText.implicitHeight + Style.space(8)
+                    implicitWidth: globalChoiceLabels.implicitWidth + Style.space(18)
+                    implicitHeight: globalChoiceLabels.implicitHeight + Style.space(10)
                     radius: Style.cornerRadius
                     color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
                     borderSpec: isActive
                       ? Border.controlSpec("selected", Color.accent, Color.accent)
                       : Border.controlSpec("normal", root.dim, Color.accent)
 
-                    Text {
-                      textFormat: Text.PlainText
-                      id: globalChoiceText
+                    Column {
+                      id: globalChoiceLabels
                       anchors.centerIn: parent
-                      text: modelData.label
-                      color: isActive ? root.foreground : root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      font.bold: isActive
+                      spacing: Style.space(1)
+
+                      Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        textFormat: Text.PlainText
+                        text: modelData.label
+                        color: isActive ? root.foreground : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: isActive
+                      }
+
+                      Text {
+                        visible: Boolean(modelData.role)
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        textFormat: Text.PlainText
+                        text: modelData.role
+                        color: isActive ? Color.accent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
                     }
 
                     MouseArea {
@@ -530,31 +591,33 @@ Panel {
                   width: parent.width
                   implicitHeight: Math.max(headerRow.implicitHeight, manageBtn.implicitHeight)
 
-                  Row {
+                  Column {
                     id: headerRow
                     anchors.left: parent.left
                     anchors.right: manageBtn.left
                     anchors.rightMargin: Style.space(6)
-                    spacing: Style.space(8)
+                    spacing: Style.space(2)
 
                     Text {
-                      id: vendorText
+                      id: gpuNameText
                       textFormat: Text.PlainText
-                      text: gpu.vendor
+                      text: gpu.displayName || ("GPU " + (index + 1))
                       color: gpu.vendor === "NVIDIA" ? Color.accent : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: true
+                      width: parent.width
+                      elide: Text.ElideRight
                     }
 
                     Text {
-                      textFormat: Text.StyledText
-                      text: root.formatModelText(gpu.model)
+                      textFormat: Text.PlainText
+                      text: (gpu.role ? gpu.role + " · " : "") + (gpu.driver || "unknown")
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
-                      width: parent.width - vendorText.width - Style.space(8)
+                      width: parent.width
                     }
                   }
 
@@ -918,31 +981,42 @@ Panel {
                         spacing: Style.space(6)
 
                         Repeater {
-                          model: [
-                            { key: "amd", label: "AMD" },
-                            { key: "auto", label: "Default" },
-                            { key: "nvidia", label: "NVIDIA" }
-                          ]
+                          model: root.appRoutingChoices
 
                           delegate: BorderSurface {
                             readonly property bool isActive: entry.gpu === modelData.key
-                            implicitWidth: appChoiceText.implicitWidth + Style.space(12)
-                            implicitHeight: appChoiceText.implicitHeight + Style.space(6)
+                            implicitWidth: appChoiceLabels.implicitWidth + Style.space(14)
+                            implicitHeight: appChoiceLabels.implicitHeight + Style.space(8)
                             radius: Style.cornerRadius
                             color: isActive ? Style.selectedFillFor(root.foreground, root.foreground) : "transparent"
                             borderSpec: isActive
                               ? Border.controlSpec("selected", Color.accent, Color.accent)
                               : Border.controlSpec("normal", root.dim, Color.accent)
 
-                            Text {
-                              textFormat: Text.PlainText
-                              id: appChoiceText
+                            Column {
+                              id: appChoiceLabels
                               anchors.centerIn: parent
-                              text: modelData.label
-                              color: isActive ? root.foreground : root.dim
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                              font.bold: isActive
+                              spacing: Style.space(1)
+
+                              Text {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                textFormat: Text.PlainText
+                                text: modelData.label
+                                color: isActive ? root.foreground : root.dim
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                font.bold: isActive
+                              }
+
+                              Text {
+                                visible: Boolean(modelData.role)
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                textFormat: Text.PlainText
+                                text: modelData.role
+                                color: isActive ? Color.accent : root.dim
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                              }
                             }
 
                             MouseArea {

@@ -77,6 +77,65 @@ def read_sysfs(path):
     return None
 
 
+def friendly_gpu_name(vendor, model, index):
+    """Return a compact, user-facing identity without relying on card order."""
+    model = (model or "").strip()
+    bracketed = re.search(r"\[([^\]]+)\]", model)
+    if bracketed:
+        marketing_name = bracketed.group(1).split("/")[0].strip()
+        if marketing_name:
+            model = marketing_name
+    model = re.sub(r"\s*\(rev [^)]+\)\s*$", "", model, flags=re.IGNORECASE).strip()
+    model = re.sub(rf"^{re.escape(vendor)}\s+", "", model, flags=re.IGNORECASE).strip()
+    if model and not model.lower().startswith("graphics (unknown"):
+        return f"{vendor} {model}" if vendor != "Generic" else model
+    return f"GPU {index + 1}"
+
+
+def compact_gpu_name(display_name, vendor):
+    """Short selector label; full display_name remains available elsewhere."""
+    name = re.sub(rf"^{re.escape(vendor)}\s+", "", display_name, flags=re.IGNORECASE)
+    name = re.sub(r"\b(?:GeForce|Radeon)\b\s*", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b(?:Laptop GPU|Mobile|Series|Graphics|Max-Q)\b", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+", " ", name).strip(" -/")
+    if vendor and vendor != "Generic" and name:
+        return f"{vendor} {name}"
+    return name or vendor or display_name
+
+
+def add_gpu_identity(gpus):
+    """Add display names, optional roles, and safe routing keys.
+
+    PRIME routing currently supports one non-NVIDIA display GPU plus one
+    NVIDIA offload GPU. Other detected GPUs remain visible for telemetry but
+    are not presented as routable targets.
+    """
+    for index, gpu in enumerate(gpus):
+        gpu["displayName"] = friendly_gpu_name(gpu.get("vendor", "Generic"), gpu.get("model"), index)
+        gpu["shortName"] = compact_gpu_name(gpu["displayName"], gpu.get("vendor", "Generic"))
+        gpu["role"] = None
+        gpu["routeKey"] = None
+
+    nvidia = [gpu for gpu in gpus if gpu.get("vendor") == "NVIDIA"]
+    non_nvidia = [gpu for gpu in gpus if gpu.get("vendor") != "NVIDIA"]
+    if len(nvidia) != 1 or not non_nvidia:
+        return gpus
+
+    primary_candidates = [gpu for gpu in non_nvidia if gpu.get("bootVga")]
+    if len(primary_candidates) == 1:
+        integrated = primary_candidates[0]
+    elif len(non_nvidia) == 1:
+        integrated = non_nvidia[0]
+    else:
+        return gpus
+
+    integrated["role"] = "Integrated"
+    integrated["routeKey"] = "amd"  # Legacy persisted key: means non-NVIDIA/default path.
+    nvidia[0]["role"] = "Discrete"
+    nvidia[0]["routeKey"] = "nvidia"
+    return gpus
+
+
 def scan_gpu_telemetry():
     """Cheap per-GPU telemetry: vendor, temp, VRAM, busy%, power. Safe to
     poll frequently — only reads a handful of small sysfs files per card."""
@@ -93,6 +152,7 @@ def scan_gpu_telemetry():
         device_id = read_sysfs(dev_path / "device") or "Unknown"
         driver_link = dev_path / "driver"
         driver = driver_link.resolve().name if driver_link.exists() else "unknown"
+        boot_vga = read_sysfs(dev_path / "boot_vga") == "1"
 
         vendor = "Generic"
         if "0x1002" in vendor_id.lower():
@@ -162,6 +222,7 @@ def scan_gpu_telemetry():
             "vendor": vendor,
             "model": model,
             "driver": driver,
+            "bootVga": boot_vga,
             "tempC": temp_c,
             "vramUsedMb": vram_used_mb if vram_total_mb > 0 else None,
             "vramTotalMb": vram_total_mb if vram_total_mb > 0 else None,
@@ -212,12 +273,13 @@ def scan_gpu_telemetry():
             model_name = re.sub(r'^NVIDIA\s+', '', parts[0]).strip()
             gpus.append({
                 "id": f"nvidia{i}", "vendor": "NVIDIA", "model": model_name, "driver": "nvidia",
+                "bootVga": False,
                 "supportsTuning": False, "performanceLevel": None,
                 "supportsFanControl": False, "fanMode": None,
                 **telemetry,
             })
 
-    return gpus
+    return add_gpu_identity(gpus)
 
 
 def get_render_default():
@@ -646,9 +708,8 @@ def main():
             return
 
     gpus = scan_gpu_telemetry()
-    distinct_vendors = sorted(set(g["vendor"] for g in gpus))
-    has_nvidia = any(g["vendor"] == "NVIDIA" for g in gpus)
-    is_hybrid = has_nvidia and len(distinct_vendors) > 1
+    route_keys = {g["routeKey"] for g in gpus if g.get("routeKey")}
+    is_hybrid = {"amd", "nvidia"}.issubset(route_keys)
 
     output = {
         "gpus": gpus,

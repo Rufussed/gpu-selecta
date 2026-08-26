@@ -1,4 +1,8 @@
-# GPU Switch for Omarchy
+# GPU Selecta for Omarchy
+
+<p align="center">
+  <img src="assets/gpu-selecta-icon.svg" width="128" height="96" alt="GPU Selecta icon">
+</p>
 
 An [Omarchy](https://omarchy.org/) shell plugin for hybrid AMD/NVIDIA (or Intel/NVIDIA)
 laptops: live telemetry for every GPU, a global default-renderer toggle, and
@@ -33,7 +37,7 @@ vars only apply at process launch.
 ## Install
 
 ```sh
-omarchy plugin add https://github.com/Rufussed/gpu-switch.git --enable
+omarchy plugin add https://github.com/Rufussed/gpu-selecta.git --enable
 ```
 
 If the widget doesn't appear, restart the shell once:

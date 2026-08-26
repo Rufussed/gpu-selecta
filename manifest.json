@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "rufussed.gpu-switch",
-  "name": "GPU Switch",
+  "name": "GPU Selecta",
   "version": "1.0.0",
   "author": "rufussed",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "GPU Switch",
+    "displayName": "GPU Selecta",
     "description": "Global default-renderer toggle and per-app GPU pinning for hybrid laptops (PRIME render offload).",
     "category": "System",
     "aliases": [
