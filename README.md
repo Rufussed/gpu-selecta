@@ -1,16 +1,10 @@
-# GPU Selecta for Omarchy
+# GPU Selecta : A multiple GPU control system for Omarchy * with vinyl scratch vibes *
 
-<p align="center">
-  <img src="assets/gpu-selecta-icon.svg" width="128" height="96" alt="GPU Selecta icon">
-</p>
+GPU Selecta is an [Omarchy](https://omarchy.org/) plugin dashboard for Linux systems
+with multiple GPUs. You can set your default GPU from those in your system.  You can specify which GPU will be used by any App: so if you have graphics heavy games or 3d software like Blender or Unreal Engine, you can assign that to run on your most powerful GPU and let everything else run on the low powered integrated system.  Do it your way!
+Keep you system cool, and let it rip when it needs too while you enoy the vinyl vibes.
 
-GPU Selecta is an [Omarchy](https://omarchy.org/) dashboard for Linux systems
-with multiple GPUs. It discovers each GPU by model, shows live telemetry, and
-exposes the power and fan controls supported by the hardware. On compatible
-hybrid systems, it can also choose the default renderer globally or pin
-individual applications to a GPU.
-
-<p align="center">
+<p align="top">
   <img src="assets/GPU-Selecta.webp" width="49%" alt="GPU Selecta overview showing global GPU selection and live telemetry">
   <img src="assets/GPU-Selecta-Apps.webp" width="49%" alt="GPU Selecta apps panel showing per-application GPU selection">
 </p>
