@@ -24,6 +24,15 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   property var gpus: []
+  readonly property var orderedGpus: {
+    var items = root.gpus.slice()
+    var rank = { "Integrated": 0, "Discrete": 1 }
+    items.sort(function(a, b) {
+      return (rank[a.role] !== undefined ? rank[a.role] : 2) -
+             (rank[b.role] !== undefined ? rank[b.role] : 2)
+    })
+    return items
+  }
   property bool isHybrid: false
   property string renderDefault: "amd"
   property string copiedNotice: ""
@@ -149,37 +158,55 @@ Panel {
     root.scratchGifForwardNext = !root.scratchGifForwardNext
   }
 
-  // Shared 0..1 gauge for the telemetry bars: green at the low end of the
-  // given range, red at the high end, same threshold bands the VRAM bar
-  // already used (green <70%, accent 70-89%, urgent >=90%).
+  // Shared 0..1 geometry for telemetry bars. Each metric chooses its own
+  // meaningful maximum and severity thresholds below.
   function gaugeRatio(value, min, max) {
     if (value === null || value === undefined) return 0
+    if (min === null || min === undefined || max === null || max === undefined || max <= min) return 0
     return Math.max(0, Math.min(1, (value - min) / (max - min)))
   }
 
-  function gaugeColor(ratio) {
+  function gaugeColor(metric, value, ratio) {
     var pct = ratio * 100
-    return pct >= 90 ? root.urgent : (pct >= 70 ? Color.accent : "#87c095")
+    var yellowAt = 60
+    var orangeAt = 80
+    var redAt = 90
+
+    if (metric === "temperature") {
+      pct = value
+      yellowAt = 65
+      orangeAt = 80
+      redAt = 90
+    } else if (metric === "vram") {
+      yellowAt = 70
+      orangeAt = 85
+      redAt = 95
+    } else if (metric === "busy") {
+      yellowAt = 60
+      orangeAt = 80
+      redAt = 95
+    } else if (metric === "power") {
+      yellowAt = 50
+      orangeAt = 75
+      redAt = 90
+    }
+
+    if (pct >= redAt) return root.urgent
+    if (pct >= orangeAt) return "#d4843e"
+    if (pct >= yellowAt) return "#e6b450"
+    return "#87c095"
   }
 
-  // Temp gauge range: ~40°C is a GPU sitting comfortably idle, ~90°C is
-  // where laptop GPUs (AMD and NVIDIA alike) start thermal-throttling —
-  // so this maps roughly to "cold" -> "throttle risk".
-  readonly property real tempGaugeMin: 40
-  readonly property real tempGaugeMax: 90
+  function temperatureGaugeMax(gpu) {
+    return gpu.tempCriticalC !== null && gpu.tempCriticalC !== undefined && gpu.tempCriticalC > 0
+      ? gpu.tempCriticalC : 100
+  }
 
-  // Power gauge range: prefer the GPU's own reported cap (power1_cap on
-  // amdgpu, power.limit on nvidia-smi) when the driver exposes one. Most
-  // laptop hybrid setups don't (this iGPU has no power1_cap node at all;
-  // nvidia-smi reports power.limit as N/A outside persistence mode), so
-  // fall back to a role-based guess: ~35W ceiling for the GPU that's
-  // actually driving the display (bootVga, almost always the integrated
-  // one), ~150W for a discrete GPU — typical laptop dGPU TBP territory.
   function powerGaugeMax(gpu) {
     if (gpu.powerLimitWatts !== null && gpu.powerLimitWatts !== undefined && gpu.powerLimitWatts > 0) {
       return gpu.powerLimitWatts
     }
-    return gpu.bootVga ? 35 : 150
+    return gpu.powerObservedMaxWatts || 0
   }
 
   // GPU model strings look like "GA106M [GeForce RTX 3060 Mobile / Max-Q] (rev a1)"
@@ -315,7 +342,8 @@ Panel {
             var res = JSON.parse(text)
             if (res.status === "success") {
               if (res.renderDefault) {
-                root.copiedNotice = "Default renderer: " + root.routingLabel(res.renderDefault)
+                // The selected default button already reflects this change.
+                root.copiedNotice = ""
               } else if (res.appKey && res.gpu) {
                 // The pill highlight already shows the new selection — no
                 // need for a redundant top-of-panel banner on every click.
@@ -370,7 +398,9 @@ Panel {
     focusTarget: keyCatcher
 
     contentWidth: panel.fittedContentWidth(Style.space(440))
-    contentHeight: panel.fittedContentHeight(mainLayout.implicitHeight, Style.space(620))
+    // Let Manage sections grow the card with their implicit content. The
+    // helper still caps the result to the usable screen height.
+    contentHeight: panel.fittedContentHeight(mainLayout.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -408,6 +438,7 @@ Panel {
             playing: root.scratchGifMode === "idle" || root.scratchGifMode === "forward"
             speed: root.scratchGifMode === "forward" ? 2.0 : 0.5
             cache: true
+            layer.enabled: true
 
             onStatusChanged: {
               if (status !== Image.Ready) return
@@ -425,6 +456,30 @@ Panel {
                 root.scratchGifIdleVariant = 2
                 root.scratchGifMode = "idle"
               }
+            }
+          }
+
+          MultiEffect {
+            anchors.fill: scratchGifImage
+            source: scratchGifImage
+            colorization: 0.7
+            colorizationColor: Color.accent
+          }
+
+          Row {
+            id: heroButtonRow
+            anchors.top: scratchGifImage.top
+            anchors.right: scratchGifImage.right
+            anchors.margins: Style.space(4)
+            spacing: Style.space(4)
+            z: 2
+
+            PanelActionButton {
+              id: heroMuteAction
+              iconText: root.soundMuted ? "" : ""
+              tooltipText: root.soundMuted ? "Unmute button sounds" : "Mute button sounds"
+              foreground: root.soundMuted ? root.dim : root.foreground
+              onClicked: root.soundMuted = !root.soundMuted
             }
           }
 
@@ -456,7 +511,7 @@ Panel {
             anchors.left: parent.left
             anchors.right: scratchGifImage.left
             anchors.rightMargin: Style.space(12)
-            implicitHeight: heroTopRow.implicitHeight + Style.space(8) + heroButtonRow.implicitHeight
+            implicitHeight: heroTopRow.implicitHeight
 
             Item {
               id: heroTopRow
@@ -465,38 +520,23 @@ Panel {
               anchors.right: parent.right
               implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
 
-              Item {
+              Text {
                 id: heroIcon
                 anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                implicitWidth: 32
-                implicitHeight: 24
-
-                Image {
-                  id: heroIconImage
-                  anchors.fill: parent
-                  source: Qt.resolvedUrl("assets/gpu-selecta-icon.svg")
-                  sourceSize.width: Math.round(width * Screen.devicePixelRatio)
-                  sourceSize.height: Math.round(height * Screen.devicePixelRatio)
-                  fillMode: Image.PreserveAspectFit
-                  visible: false
-                  layer.enabled: true
-                }
-
-                MultiEffect {
-                  anchors.fill: heroIconImage
-                  source: heroIconImage
-                  colorization: 1.0
-                  colorizationColor: root.renderDefault === "nvidia" ? Color.accent : root.foreground
-                }
+                anchors.top: parent.top
+                anchors.topMargin: -Style.space(18)
+                text: "󰢮"
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: 44
               }
 
               Column {
                 id: heroLabels
                 anchors.left: heroIcon.right
-                anchors.leftMargin: Style.space(12)
+                anchors.leftMargin: Style.space(8)
                 anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
+                anchors.top: parent.top
                 spacing: Style.space(2)
 
                 Text {
@@ -510,7 +550,7 @@ Panel {
 
                 Text {
                   textFormat: Text.PlainText
-                  text: "Spin your GPUs your way!"
+                  text: "Spin your GPUs\nYour way!"
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -518,25 +558,10 @@ Panel {
               }
             }
 
-            Row {
-              id: heroButtonRow
-              anchors.top: heroTopRow.bottom
-              anchors.topMargin: Style.space(8)
-              anchors.right: parent.right
-              spacing: Style.space(4)
-
-              PanelActionButton {
-                id: heroMuteAction
-                iconText: root.soundMuted ? "" : ""
-                tooltipText: root.soundMuted ? "Unmute button sounds" : "Mute button sounds"
-                foreground: root.soundMuted ? root.dim : root.foreground
-                onClicked: root.soundMuted = !root.soundMuted
-              }
-            }
           }
 
           // ------------------ NAVIGATION TABS ------------------
-          // Flows below the logo/title/mute block, left of the gif, so the
+          // Flows below the logo/title block, left of the gif, so the
           // tabs share the header's vertical space instead of adding a row.
           Row {
             id: tabsRow
@@ -678,7 +703,7 @@ Panel {
                         anchors.horizontalCenter: parent.horizontalCenter
                         textFormat: Text.PlainText
                         text: modelData.label
-                        color: isActive ? root.foreground : root.dim
+                        color: isActive ? Color.accent : root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         font.bold: isActive
@@ -689,7 +714,7 @@ Panel {
                         anchors.horizontalCenter: parent.horizontalCenter
                         textFormat: Text.PlainText
                         text: modelData.role
-                        color: isActive ? Color.accent : root.dim
+                        color: isActive ? root.foreground : root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                       }
@@ -721,7 +746,7 @@ Panel {
 
           // ------------------ LIVE TELEMETRY (both GPUs) ------------------
           Repeater {
-            model: root.gpus
+            model: root.orderedGpus
 
             delegate: BorderSurface {
               readonly property var gpu: modelData
@@ -755,7 +780,7 @@ Panel {
                       id: gpuNameText
                       textFormat: Text.PlainText
                       text: gpu.displayName || ("GPU " + (index + 1))
-                      color: gpu.vendor === "NVIDIA" ? Color.accent : root.foreground
+                      color: root.renderDefault === gpu.routeKey ? Color.accent : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: true
@@ -763,15 +788,6 @@ Panel {
                       elide: Text.ElideRight
                     }
 
-                    Text {
-                      textFormat: Text.PlainText
-                      text: (gpu.role ? gpu.role + " · " : "") + (gpu.driver || "unknown")
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                      width: parent.width
-                    }
                   }
 
                   BorderSurface {
@@ -817,127 +833,81 @@ Panel {
                   }
                 }
 
-                // Temp gauge
+                // Telemetry: fixed 25% value column with aligned gauges in
+                // the remaining space.
                 Column {
+                  id: telemetryMetrics
                   width: parent.width
-                  spacing: Style.space(2)
-                  visible: gpu.tempC !== null && gpu.tempC !== undefined
+                  spacing: Style.space(5)
 
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "Temp: " + Math.round(gpu.tempC) + "°C"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
+                  Repeater {
+                    model: [
+                      {
+                        available: gpu.tempC !== null && gpu.tempC !== undefined,
+                        metric: "temperature",
+                        value: gpu.tempC || 0,
+                        label: "Temp: " + Math.round(gpu.tempC || 0) + "°C",
+                        ratio: root.gaugeRatio(gpu.tempC, 0, root.temperatureGaugeMax(gpu))
+                      },
+                      {
+                        available: gpu.busyPercent !== null && gpu.busyPercent !== undefined,
+                        metric: "busy",
+                        value: gpu.busyPercent || 0,
+                        label: "GPU Load: " + (gpu.busyPercent || 0) + "%",
+                        ratio: root.gaugeRatio(gpu.busyPercent, 0, 100)
+                      },
+                      {
+                        available: gpu.powerWatts !== null && gpu.powerWatts !== undefined,
+                        metric: "power",
+                        value: gpu.powerWatts || 0,
+                        label: "Power: " + (gpu.powerWatts || 0) + " W",
+                        ratio: root.gaugeRatio(gpu.powerWatts, 0, root.powerGaugeMax(gpu))
+                      },
+                      {
+                        available: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined,
+                        metric: "vram",
+                        value: gpu.vramPercent || 0,
+                        label: "VRAM: " + ((gpu.vramPercent !== null && gpu.vramPercent !== undefined) ? gpu.vramPercent : 0) + "%",
+                        ratio: root.gaugeRatio(gpu.vramPercent, 0, 100)
+                      }
+                    ]
 
-                  Rectangle {
-                    id: tempBarTrack
-                    width: parent.width
-                    height: Style.space(6)
-                    radius: height / 2
-                    color: Qt.darker(root.foreground, 4)
+                    delegate: Item {
+                      required property var modelData
+                      visible: modelData.available
+                      width: telemetryMetrics.width
+                      height: Math.max(metricText.implicitHeight, metricBarTrack.height)
 
-                    Rectangle {
-                      readonly property real ratio: root.gaugeRatio(gpu.tempC, root.tempGaugeMin, root.tempGaugeMax)
-                      width: tempBarTrack.width * ratio
-                      height: parent.height
-                      radius: height / 2
-                      color: root.gaugeColor(ratio)
-                    }
-                  }
-                }
+                      Text {
+                        id: metricText
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width * 0.25
+                        textFormat: Text.PlainText
+                        text: modelData.label
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                      }
 
-                // Busy gauge
-                Column {
-                  width: parent.width
-                  spacing: Style.space(2)
-                  visible: gpu.busyPercent !== null && gpu.busyPercent !== undefined
+                      Rectangle {
+                        id: metricBarTrack
+                        anchors.left: metricText.right
+                        anchors.leftMargin: Style.space(8)
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        height: Style.space(6)
+                        radius: height / 2
+                        color: Qt.darker(root.foreground, 4)
 
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "Busy: " + gpu.busyPercent + "%"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Rectangle {
-                    id: busyBarTrack
-                    width: parent.width
-                    height: Style.space(6)
-                    radius: height / 2
-                    color: Qt.darker(root.foreground, 4)
-
-                    Rectangle {
-                      readonly property real ratio: root.gaugeRatio(gpu.busyPercent, 0, 100)
-                      width: busyBarTrack.width * ratio
-                      height: parent.height
-                      radius: height / 2
-                      color: root.gaugeColor(ratio)
-                    }
-                  }
-                }
-
-                // Power gauge
-                Column {
-                  width: parent.width
-                  spacing: Style.space(2)
-                  visible: gpu.powerWatts !== null && gpu.powerWatts !== undefined
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "Power: " + gpu.powerWatts + " W"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Rectangle {
-                    id: powerBarTrack
-                    width: parent.width
-                    height: Style.space(6)
-                    radius: height / 2
-                    color: Qt.darker(root.foreground, 4)
-
-                    Rectangle {
-                      readonly property real ratio: root.gaugeRatio(gpu.powerWatts, 0, root.powerGaugeMax(gpu))
-                      width: powerBarTrack.width * ratio
-                      height: parent.height
-                      radius: height / 2
-                      color: root.gaugeColor(ratio)
-                    }
-                  }
-                }
-
-                // VRAM gauge
-                Column {
-                  width: parent.width
-                  spacing: Style.space(2)
-                  visible: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: Math.round(gpu.vramUsedMb || 0) + " / " + Math.round(gpu.vramTotalMb || 0) + " MB VRAM" +
-                          ((gpu.vramPercent !== null && gpu.vramPercent !== undefined) ? " (" + gpu.vramPercent + "%)" : "")
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Rectangle {
-                    id: vramBarTrack
-                    width: parent.width
-                    height: Style.space(6)
-                    radius: height / 2
-                    color: Qt.darker(root.foreground, 4)
-
-                    Rectangle {
-                      readonly property real ratio: root.gaugeRatio(gpu.vramPercent, 0, 100)
-                      width: vramBarTrack.width * ratio
-                      height: parent.height
-                      radius: height / 2
-                      color: root.gaugeColor(ratio)
+                        Rectangle {
+                          width: metricBarTrack.width * modelData.ratio
+                          height: parent.height
+                          radius: height / 2
+                          color: root.gaugeColor(modelData.metric, modelData.value, modelData.ratio)
+                        }
+                      }
                     }
                   }
                 }
@@ -1108,26 +1078,10 @@ Panel {
             spacing: Style.space(6)
 
             TextField {
-              width: parent.width - refreshAppsBtn.implicitWidth - Style.space(6)
+              width: parent.width
               placeholderText: "Filter apps..."
               text: root.appFilter
               onTextChanged: root.appFilter = text
-            }
-
-            PanelActionButton {
-              id: refreshAppsBtn
-              iconText: ""
-              tooltipText: root.appsLoading ? "Scanning installed apps..." : "Rescan installed apps"
-              foreground: root.appsLoading ? Color.accent : root.foreground
-              onClicked: root.loadApps()
-
-              RotationAnimation on rotation {
-                from: 0
-                to: 360
-                duration: 800
-                loops: Animation.Infinite
-                running: root.appsLoading
-              }
             }
           }
 

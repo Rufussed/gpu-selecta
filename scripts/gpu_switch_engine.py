@@ -54,6 +54,9 @@ APP_GPU_STATE_FILE = HOME / ".config" / "omarchy" / "gpu-switch" / "apps.json"
 APP_GPU_BACKUP_DIR = HOME / ".config" / "omarchy" / "gpu-switch" / "backups"
 APP_GPU_WRAPPER_DIR = HOME / ".config" / "omarchy" / "gpu-switch" / "wrappers"
 APP_GPU_MARKER = "# Written by the GPU Switch plugin — per-app GPU override\n"
+TELEMETRY_EXTREMA_FILE = (
+    HOME / ".local" / "state" / "omarchy" / "gpu-selecta" / "telemetry-extrema.json"
+)
 
 # Standard XDG desktop-entry field codes — kept in place (appended after the
 # wrapper path) so launchers that do proper Exec= parsing still see them and
@@ -138,6 +141,67 @@ def add_gpu_identity(gpus):
     return gpus
 
 
+def load_telemetry_history():
+    if not TELEMETRY_EXTREMA_FILE.exists():
+        return {}
+    try:
+        saved = json.loads(TELEMETRY_EXTREMA_FILE.read_text())
+        return saved if isinstance(saved, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def update_telemetry_history(gpus):
+    """Persist the highest observed power draw and attach it to each GPU.
+
+    PCI addresses survive card-number reordering. Synthetic GPU entries fall
+    back to a vendor/model identity when no PCI address is available.
+    """
+    history = load_telemetry_history()
+    changed = False
+
+    for gpu in gpus:
+        key = gpu.get("pciAddress") or f"{gpu.get('vendor', 'gpu')}:{gpu.get('model', gpu.get('id', 'unknown'))}"
+        record = history.get(key)
+        if not isinstance(record, dict):
+            record = {}
+            history[key] = record
+            changed = True
+
+        value = gpu.get("powerWatts")
+        if not isinstance(value, (int, float)):
+            gpu["powerObservedMaxWatts"] = None
+            continue
+
+        # Migrate the min/max structure written by the short-lived initial
+        # implementation without throwing away its learned peak.
+        stored_max = record.get("powerObservedMaxWatts")
+        legacy_bounds = record.get("powerWatts")
+        if not isinstance(stored_max, (int, float)) and isinstance(legacy_bounds, dict):
+            stored_max = legacy_bounds.get("max")
+        if not isinstance(stored_max, (int, float)):
+            stored_max = value
+
+        observed_max = max(stored_max, value)
+        if record.get("powerObservedMaxWatts") != observed_max or "powerWatts" in record or "tempC" in record:
+            record["powerObservedMaxWatts"] = observed_max
+            record.pop("powerWatts", None)
+            record.pop("tempC", None)
+            changed = True
+        gpu["powerObservedMaxWatts"] = observed_max
+
+    if changed:
+        try:
+            TELEMETRY_EXTREMA_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = TELEMETRY_EXTREMA_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(history, indent=2))
+            os.replace(tmp, TELEMETRY_EXTREMA_FILE)
+        except OSError:
+            pass
+
+    return gpus
+
+
 def scan_gpu_telemetry():
     """Cheap per-GPU telemetry: vendor, temp, VRAM, busy%, power. Safe to
     poll frequently — only reads a handful of small sysfs files per card."""
@@ -194,6 +258,7 @@ def scan_gpu_telemetry():
         busy_percent = int(busy) if busy and busy.isdigit() else None
 
         temp_c = None
+        temp_critical_c = None
         power_w = None
         power_limit_w = None
         fan_mode = None
@@ -204,6 +269,9 @@ def scan_gpu_telemetry():
             t = read_sysfs(hdir / "temp1_input")
             if t and t.isdigit():
                 temp_c = round(int(t) / 1000, 1)
+            critical = read_sysfs(hdir / "temp1_crit") or read_sysfs(hdir / "temp1_max")
+            if critical and critical.isdigit():
+                temp_critical_c = round(int(critical) / 1000, 1)
             p = read_sysfs(hdir / "power1_average") or read_sysfs(hdir / "power1_input")
             if p and p.isdigit():
                 power_w = round(int(p) / 1000000.0, 1)
@@ -232,6 +300,7 @@ def scan_gpu_telemetry():
             "pciAddress": pci_addr,
             "driPrime": "pci-" + re.sub(r"[:.]", "_", pci_addr),
             "tempC": temp_c,
+            "tempCriticalC": temp_critical_c,
             "vramUsedMb": vram_used_mb if vram_total_mb > 0 else None,
             "vramTotalMb": vram_total_mb if vram_total_mb > 0 else None,
             "vramPercent": vram_percent,
@@ -253,7 +322,7 @@ def scan_gpu_telemetry():
     nvidia_rows = []
     try:
         res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=gpu_name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit",
+            ["nvidia-smi", "--query-gpu=gpu_name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit,power.default_limit,temperature.gpu.tlimit",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=1.0)
         if res.returncode == 0:
@@ -268,14 +337,17 @@ def scan_gpu_telemetry():
     for i, parts in enumerate(nvidia_rows):
         vram_used = float(parts[1])
         vram_total = float(parts[2])
+        current_power_limit = float(parts[6]) if len(parts) > 6 and _is_number(parts[6]) else None
+        default_power_limit = float(parts[7]) if len(parts) > 7 and _is_number(parts[7]) else None
         telemetry = {
             "tempC": float(parts[4]),
+            "tempCriticalC": float(parts[8]) if len(parts) > 8 and _is_number(parts[8]) else None,
             "vramUsedMb": vram_used,
             "vramTotalMb": vram_total,
             "vramPercent": round((vram_used / vram_total) * 100, 1) if vram_total > 0 else None,
             "busyPercent": int(parts[3]) if parts[3].isdigit() else None,
             "powerWatts": float(parts[5]) if len(parts) > 5 and _is_number(parts[5]) else None,
-            "powerLimitWatts": float(parts[6]) if len(parts) > 6 and _is_number(parts[6]) else None,
+            "powerLimitWatts": current_power_limit if current_power_limit is not None else default_power_limit,
         }
         if i < len(nvidia_entries):
             nvidia_entries[i].update(telemetry)
@@ -290,7 +362,7 @@ def scan_gpu_telemetry():
                 **telemetry,
             })
 
-    return add_gpu_identity(gpus)
+    return update_telemetry_history(add_gpu_identity(gpus))
 
 
 def get_render_default():

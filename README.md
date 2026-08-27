@@ -10,6 +10,13 @@ exposes the power and fan controls supported by the hardware. On compatible
 hybrid systems, it can also choose the default renderer globally or pin
 individual applications to a GPU.
 
+<p align="center">
+  <img src="assets/GPU-Selecta.webp" width="49%" alt="GPU Selecta overview showing global GPU selection and live telemetry">
+  <img src="assets/GPU-Selecta-Apps.webp" width="49%" alt="GPU Selecta apps panel showing per-application GPU selection">
+</p>
+
+<p align="center"><em>Global GPU selection and telemetry · Per-application GPU routing</em></p>
+
 Renderer switching uses stable PCI addresses with Mesa's `DRI_PRIME` support
 for AMD, Intel, and Nouveau GPUs. Proprietary NVIDIA GPUs use NVIDIA PRIME
 render offload. Other detected GPUs still appear in the dashboard, but GPU
@@ -163,6 +170,11 @@ rather edit it directly:
 
 Any app not listed here defaults to `"auto"` (follow the global toggle) —
 this file only needs entries for apps you've actually pinned.
+
+The learned fallback power maximum lives in
+`~/.local/state/omarchy/gpu-selecta/telemetry-extrema.json`. Delete that file
+to reset it. Temperature uses the GPU's reported critical temperature when
+available and a 100°C fallback otherwise.
 
 ## Security
 
