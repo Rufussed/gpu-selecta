@@ -1,8 +1,11 @@
-# GPU Selecta : A multiple GPU control system for Omarchy * with vinyl scratch vibes *
+# GPU Selecta
 
 GPU Selecta is an [Omarchy](https://omarchy.org/) plugin dashboard for Linux systems
-with multiple GPUs. You can set your default GPU from those in your system.  You can specify which GPU will be used by any App: so if you have graphics heavy games or 3d software like Blender or Unreal Engine, you can assign that to run on your most powerful GPU and let everything else run on the low powered integrated system.  Do it your way!
-Keep you system cool, and let it rip when it needs too while you enoy the vinyl vibes.
+with multiple GPUs—and vinyl scratch vibes. Set the default GPU for newly
+launched applications, or choose which GPU individual apps use. Graphics-heavy
+games and 3D software such as Blender or Unreal Engine can run on the most
+powerful GPU while everything else stays on the lower-powered integrated GPU.
+Keep your system cool and let it rip when it needs to.
 
 > **Inspiration:** GPU Selecta began with
 > [OmaGPU](https://github.com/ucmz851/omagpu) by ucmz851 as its starting point.
@@ -89,9 +92,10 @@ them by hand.)
 
 ## Dependencies
 
-`python3`, `hyprctl`, `lspci` — all already present on a standard Omarchy
-install. `nvidia-smi` is used opportunistically for NVIDIA telemetry/
-persistence-mode when present. No other external packages or services.
+`python3`, `hyprctl`, `lspci`, and `mpv` are present on a standard Omarchy
+install. `mpv` plays the vinyl scratch button sounds. `nvidia-smi` is used
+opportunistically for NVIDIA telemetry and persistence mode when present.
+No external services are required.
 
 ## Use
 
