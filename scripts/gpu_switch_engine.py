@@ -82,6 +82,142 @@ def _is_number(s):
         return False
 
 
+def _fdinfo_bytes(value):
+    """Parse a DRM fdinfo memory value such as ``164136 KiB``."""
+    match = re.match(r"^([0-9]+)\s*(B|KiB|MiB|GiB)?$", value.strip())
+    if not match:
+        return 0
+    amount = int(match.group(1))
+    multiplier = {None: 1, "B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
+    return amount * multiplier[match.group(2)]
+
+
+def _process_name(pid, fallback=""):
+    try:
+        name = (Path("/proc") / str(pid) / "comm").read_text().strip()
+        if name:
+            return name
+    except OSError:
+        pass
+    return fallback or f"PID {pid}"
+
+
+def _is_system_gpu_process(name):
+    return name.lower() in {
+        "hyprland", "xwayland", "quickshell", "omarchy-shell",
+        "kwin_wayland", "gnome-shell", "weston",
+    }
+
+
+def scan_drm_processes():
+    """Return cumulative per-process DRM counters grouped by PCI address.
+
+    Multiple file descriptors can expose the same DRM client, so client IDs
+    are deduplicated before their engine and memory counters are summed.
+    Counter deltas are converted to percentages by the long-running QML panel.
+    """
+    by_gpu = {}
+    seen_clients = set()
+
+    for proc_dir in Path("/proc").glob("[0-9]*"):
+        pid = int(proc_dir.name)
+        fdinfo_dir = proc_dir / "fdinfo"
+        try:
+            fdinfo_files = list(fdinfo_dir.iterdir())
+        except OSError:
+            continue
+
+        for fdinfo_path in fdinfo_files:
+            try:
+                fields = {}
+                for line in fdinfo_path.read_text().splitlines():
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    if key.startswith("drm-"):
+                        fields[key] = value.strip()
+            except OSError:
+                continue
+
+            pci_address = fields.get("drm-pdev")
+            if not pci_address:
+                continue
+            client_id = fields.get("drm-client-id", fdinfo_path.name)
+            client_key = (pid, pci_address, client_id)
+            if client_key in seen_clients:
+                continue
+            seen_clients.add(client_key)
+
+            gpu_processes = by_gpu.setdefault(pci_address, {})
+            process = gpu_processes.setdefault(pid, {
+                "pid": pid,
+                "name": _process_name(pid),
+                "system": False,
+                "source": "drm",
+                "engineGfxNs": 0,
+                "engineComputeNs": 0,
+                "vramMb": 0.0,
+                "gttMb": 0.0,
+            })
+            process["system"] = _is_system_gpu_process(process["name"])
+            process["engineGfxNs"] += int(fields.get("drm-engine-gfx", "0").split()[0])
+            process["engineComputeNs"] += int(fields.get("drm-engine-compute", "0").split()[0])
+            process["vramMb"] += _fdinfo_bytes(fields.get("drm-memory-vram", "0")) / (1024 * 1024)
+            process["gttMb"] += _fdinfo_bytes(fields.get("drm-memory-gtt", "0")) / (1024 * 1024)
+
+    result = {}
+    for pci_address, processes in by_gpu.items():
+        rows = list(processes.values())
+        for process in rows:
+            process["vramMb"] = round(process["vramMb"], 1)
+            process["gttMb"] = round(process["gttMb"], 1)
+        result[pci_address] = rows
+    return result
+
+
+def scan_nvidia_processes():
+    """Read NVIDIA's instantaneous per-process utilization when available."""
+    by_index = {}
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "pmon", "-c", "1", "-s", "um"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+        if res.returncode != 0:
+            return by_index
+        for line in res.stdout.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split(None, 11)
+            if len(parts) < 12 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            gpu_index = int(parts[0])
+            pid = int(parts[1])
+            process_type = parts[2]
+
+            def percent(value):
+                return int(value) if value.isdigit() else None
+
+            sm_percent = percent(parts[3])
+            row = {
+                "pid": pid,
+                "name": _process_name(pid, parts[11]),
+                "system": _is_system_gpu_process(_process_name(pid, parts[11])),
+                "source": "nvidia",
+                "processType": process_type,
+                "gfxPercent": sm_percent if "G" in process_type else None,
+                "computePercent": sm_percent if "C" in process_type else None,
+                "memoryPercent": percent(parts[4]),
+                "encoderPercent": percent(parts[5]),
+                "decoderPercent": percent(parts[6]),
+                "vramMb": float(parts[9]) if _is_number(parts[9]) else None,
+            }
+            by_index.setdefault(gpu_index, []).append(row)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return by_index
+
+
 def friendly_gpu_name(vendor, model, index):
     """Return a compact, user-facing identity without relying on card order."""
     model = (model or "").strip()
@@ -290,6 +426,10 @@ def scan_gpu_telemetry():
         # Intel drivers don't expose power_dpm_force_performance_level.
         performance_level = read_sysfs(dev_path / "power_dpm_force_performance_level")
         supports_tuning = performance_level is not None
+        connected_outputs = []
+        for connector in Path("/sys/class/drm").glob(f"{card.name}-*"):
+            if read_sysfs(connector / "status") == "connected":
+                connected_outputs.append(connector.name[len(card.name) + 1:])
 
         gpus.append({
             "id": card.name,
@@ -311,6 +451,8 @@ def scan_gpu_telemetry():
             "performanceLevel": performance_level,
             "supportsFanControl": supports_fan_control,
             "fanMode": fan_mode,
+            "connectedOutputs": sorted(connected_outputs),
+            "processes": [],
         })
 
     # The NVIDIA proprietary driver doesn't populate the amdgpu-style sysfs
@@ -359,8 +501,19 @@ def scan_gpu_telemetry():
                 "pciAddress": None, "driPrime": None,
                 "supportsTuning": False, "performanceLevel": None,
                 "supportsFanControl": False, "fanMode": None,
+                "connectedOutputs": [],
+                "processes": [],
                 **telemetry,
             })
+
+    drm_processes = scan_drm_processes()
+    for gpu in gpus:
+        gpu["processes"] = drm_processes.get(gpu.get("pciAddress"), [])
+
+    nvidia_processes = scan_nvidia_processes()
+    for index, gpu in enumerate([item for item in gpus if item["vendor"] == "NVIDIA"]):
+        if index in nvidia_processes:
+            gpu["processes"] = nvidia_processes[index]
 
     return update_telemetry_history(add_gpu_identity(gpus))
 

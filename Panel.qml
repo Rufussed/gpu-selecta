@@ -44,6 +44,9 @@ Panel {
   property bool appsLoading: false
   property string appFilter: ""
   property string expandedGpuId: ""
+  property var expandedProcessGpuIds: ({})
+  property var processCounterSamples: ({})
+  property double processSampleTimeMs: 0
 
   readonly property var tabList: [
     { label: "Overview", key: "overview" },
@@ -209,6 +212,93 @@ Panel {
     return gpu.powerObservedMaxWatts || 0
   }
 
+  function processLoad(process) {
+    return Math.max(process.gfxPercent || 0, process.computePercent || 0)
+  }
+
+  function processLoadLabel(process) {
+    var parts = []
+    if (process.gfxPercent !== null && process.gfxPercent !== undefined)
+      parts.push("G " + process.gfxPercent.toFixed(1) + "%")
+    if (process.computePercent !== null && process.computePercent !== undefined)
+      parts.push("C " + process.computePercent.toFixed(1) + "%")
+    if (process.memoryPercent !== null && process.memoryPercent !== undefined)
+      parts.push("M " + process.memoryPercent.toFixed(0) + "%")
+    return parts.length > 0 ? parts.join(" · ") : "Sampling…"
+  }
+
+  function processMemoryLabel(process) {
+    if (process.vramMb === null || process.vramMb === undefined || process.vramMb <= 0) return ""
+    return process.vramMb >= 1024
+      ? (process.vramMb / 1024).toFixed(1) + " GB"
+      : process.vramMb.toFixed(0) + " MB"
+  }
+
+  function monitorOutputNote(process, gpu) {
+    var compositorNames = ["hyprland", "kwin_wayland", "gnome-shell", "weston"]
+    var outputs = gpu.connectedOutputs || []
+    if (compositorNames.indexOf((process.name || "").toLowerCase()) === -1 || outputs.length === 0)
+      return ""
+    return "Driving " + outputs.join(", ")
+  }
+
+  function gpuProcessesExpanded(gpuId) {
+    return root.expandedProcessGpuIds[gpuId] === true
+  }
+
+  function toggleGpuProcesses(gpuId) {
+    var updated = Object.assign({}, root.expandedProcessGpuIds)
+    updated[gpuId] = !root.gpuProcessesExpanded(gpuId)
+    root.expandedProcessGpuIds = updated
+  }
+
+  function visibleGpuProcesses(processes) {
+    var rows = (processes || []).slice()
+    rows.sort(function(a, b) {
+      var loadDifference = root.processLoad(b) - root.processLoad(a)
+      if (loadDifference !== 0) return loadDifference
+      return (b.vramMb || 0) - (a.vramMb || 0)
+    })
+    if (root.processSampleTimeMs > 0) {
+      var active = rows.filter(function(process) { return root.processLoad(process) >= 0.1 })
+      if (active.length > 0) rows = active
+    }
+    return rows.slice(0, 6)
+  }
+
+  function annotateProcessLoads(gpus) {
+    var now = Date.now()
+    var elapsedNs = root.processSampleTimeMs > 0 ? (now - root.processSampleTimeMs) * 1000000 : 0
+    var nextSamples = ({})
+
+    for (var i = 0; i < gpus.length; i++) {
+      var gpu = gpus[i]
+      var processes = gpu.processes || []
+      for (var j = 0; j < processes.length; j++) {
+        var process = processes[j]
+        if (process.source !== "drm") continue
+        var key = (gpu.pciAddress || gpu.id) + ":" + process.pid
+        var previous = root.processCounterSamples[key]
+        process.gfxPercent = null
+        process.computePercent = null
+        if (previous && elapsedNs > 0) {
+          var gfxDelta = Math.max(0, (process.engineGfxNs || 0) - previous.gfx)
+          var computeDelta = Math.max(0, (process.engineComputeNs || 0) - previous.compute)
+          process.gfxPercent = Math.min(100, gfxDelta * 100 / elapsedNs)
+          process.computePercent = Math.min(100, computeDelta * 100 / elapsedNs)
+        }
+        nextSamples[key] = {
+          gfx: process.engineGfxNs || 0,
+          compute: process.engineComputeNs || 0
+        }
+      }
+    }
+
+    root.processCounterSamples = nextSamples
+    root.processSampleTimeMs = now
+    return gpus
+  }
+
   // GPU model strings look like "GA106M [GeForce RTX 3060 Mobile / Max-Q] (rev a1)"
   // — the bit between "[" and "/" is the actual marketing name and the part
   // worth drawing the eye to; the chip codename and revision are noise.
@@ -268,7 +358,7 @@ Panel {
     if (!text || text.trim() === "") return
     try {
       var data = JSON.parse(text)
-      root.gpus = data.gpus || []
+      root.gpus = root.annotateProcessLoads(data.gpus || [])
       root.isHybrid = data.isHybrid === true
       root.renderDefault = data.renderDefault || "amd"
     } catch (e) {
@@ -379,11 +469,16 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      root.processCounterSamples = ({})
+      root.processSampleTimeMs = 0
       root.refresh()
       if (!root.appsLoaded) root.loadApps()
       Qt.callLater(function() {
         if (keyCatcher) keyCatcher.forceActiveFocus()
       })
+    } else {
+      root.processCounterSamples = ({})
+      root.processSampleTimeMs = 0
     }
   }
 
@@ -751,6 +846,7 @@ Panel {
             delegate: BorderSurface {
               readonly property var gpu: modelData
               readonly property bool expanded: root.expandedGpuId === gpu.id
+              readonly property bool processListExpanded: root.gpuProcessesExpanded(gpu.id)
               width: parent.width
               implicitHeight: gpuCardCol.implicitHeight + Style.space(14)
               color: Style.hoverFillFor(root.foreground, root.foreground)
@@ -909,6 +1005,140 @@ Panel {
                         }
                       }
                     }
+                  }
+                }
+
+                // ------------------ PER-PROCESS GPU LOAD ------------------
+                Column {
+                  width: parent.width
+                  spacing: Style.space(5)
+
+                  PanelSeparator { width: parent.width }
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: processHeaderRow.implicitHeight + Style.space(4)
+
+                    Row {
+                      id: processHeaderRow
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+
+                      Text {
+                        width: parent.width * 0.7
+                        textFormat: Text.PlainText
+                        text: (processListExpanded ? "▾  " : "▸  ") + "Active GPU Load"
+                        color: processListExpanded ? Color.accent : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+
+                      Text {
+                        width: parent.width * 0.3
+                        horizontalAlignment: Text.AlignRight
+                        textFormat: Text.PlainText
+                        text: (gpu.processes || []).length + " contexts"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.toggleGpuProcesses(gpu.id)
+                    }
+                  }
+
+                  Text {
+                    visible: processListExpanded && (!gpu.processes || gpu.processes.length === 0)
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: "No readable GPU processes"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Repeater {
+                    model: processListExpanded ? root.visibleGpuProcesses(gpu.processes) : []
+
+                    delegate: Column {
+                      required property var modelData
+                      readonly property real displayedLoad: root.processLoad(modelData)
+                      width: parent.width
+                      spacing: Style.space(2)
+
+                      Row {
+                        width: parent.width
+
+                        Column {
+                          width: parent.width * 0.43
+                          spacing: 0
+
+                          Text {
+                            width: parent.width
+                            textFormat: Text.PlainText
+                            text: modelData.name + (modelData.system ? " · system" : "")
+                            color: modelData.system ? root.dim : root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            elide: Text.ElideRight
+                          }
+
+                          Text {
+                            visible: root.monitorOutputNote(modelData, gpu) !== ""
+                            width: parent.width
+                            textFormat: Text.PlainText
+                            text: root.monitorOutputNote(modelData, gpu)
+                            color: Color.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Math.max(8, Style.font.caption - 2)
+                            elide: Text.ElideRight
+                          }
+                        }
+
+                        Text {
+                          width: parent.width * 0.57
+                          horizontalAlignment: Text.AlignRight
+                          textFormat: Text.PlainText
+                          text: root.processLoadLabel(modelData) +
+                            (root.processMemoryLabel(modelData) ? " · " + root.processMemoryLabel(modelData) : "")
+                          color: displayedLoad >= 0.1 ? Color.accent : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideLeft
+                        }
+                      }
+
+                      Rectangle {
+                        width: parent.width
+                        height: Style.space(3)
+                        radius: height / 2
+                        color: Qt.darker(root.foreground, 4)
+
+                        Rectangle {
+                          width: parent.width * Math.min(1, displayedLoad / 100)
+                          height: parent.height
+                          radius: height / 2
+                          color: root.gaugeColor("busy", displayedLoad, displayedLoad / 100)
+                        }
+                      }
+                    }
+                  }
+
+                  Text {
+                    readonly property int shownCount: root.visibleGpuProcesses(gpu.processes).length
+                    visible: processListExpanded && (gpu.processes || []).length > shownCount
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: "+ " + ((gpu.processes || []).length - shownCount) + " more GPU contexts"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
                   }
                 }
 

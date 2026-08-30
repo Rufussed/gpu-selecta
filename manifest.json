@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "rufussed.gpu-switch",
   "name": "GPU Selecta",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "rufussed",
   "license": "MIT",
   "description": "Global and per-app GPU renderer switching for hybrid AMD/NVIDIA laptops via PRIME render offload.",

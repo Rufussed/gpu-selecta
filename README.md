@@ -103,7 +103,10 @@ No external services are required.
 - **Overview tab**: the **Global Default** toggle (`Integrated` / `Discrete`,
   labeled with whatever vendor is actually detected — e.g. "Integrated
   (AMD)" / "Discrete (NVIDIA)") plus a live card per GPU showing
-  temperature, busy %, power draw, and a VRAM usage bar.
+  temperature, busy %, power draw, and a VRAM usage bar. Each card also lists
+  the busiest readable GPU processes with per-process graphics/compute load
+  and VRAM usage. Desktop infrastructure such as Hyprland is marked as a
+  read-only system process.
   - Each GPU card has a **Manage** button (top right) that reveals basic
     Power Governor (`Auto`/`High`/`Low`/`Peak`) and Fan (`Auto`/`35%`/`60%`/
     `80%`/`100%`) controls, when the hardware actually exposes them over
@@ -181,7 +184,10 @@ available and a 100°C fallback otherwise.
 
 ## Security
 
-GPU/app telemetry is 100% unprivileged reads (sysfs, `.desktop` files).
+GPU/app telemetry is 100% unprivileged reads (sysfs, `.desktop` files,
+same-user `/proc/<pid>/fdinfo` DRM counters, and `nvidia-smi` when present).
+Processes owned by other users remain hidden when `/proc` permissions do not
+allow them to be read.
 Render routing (global toggle, per-app pinning) only ever writes to files
 already owned by your user account (`~/.config`, `~/.local/share/applications`,
 `~/.local/state`) — no root or `pkexec` needed for those. Power governor and
