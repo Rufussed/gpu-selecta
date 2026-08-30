@@ -46,6 +46,7 @@ Panel {
   property string expandedGpuId: ""
   property var expandedProcessGpuIds: ({})
   property var processCounterSamples: ({})
+  property var processDisplaySamples: ({})
   property double processSampleTimeMs: 0
 
   readonly property var tabList: [
@@ -224,7 +225,7 @@ Panel {
       parts.push("C " + process.computePercent.toFixed(1) + "%")
     if (process.memoryPercent !== null && process.memoryPercent !== undefined)
       parts.push("M " + process.memoryPercent.toFixed(0) + "%")
-    return parts.length > 0 ? parts.join(" · ") : "Sampling…"
+    return parts.length > 0 ? parts.join(" · ") : "0%"
   }
 
   function processMemoryLabel(process) {
@@ -270,31 +271,51 @@ Panel {
     var now = Date.now()
     var elapsedNs = root.processSampleTimeMs > 0 ? (now - root.processSampleTimeMs) * 1000000 : 0
     var nextSamples = ({})
+    var displaySamples = Object.assign({}, root.processDisplaySamples)
 
     for (var i = 0; i < gpus.length; i++) {
       var gpu = gpus[i]
       var processes = gpu.processes || []
       for (var j = 0; j < processes.length; j++) {
         var process = processes[j]
-        if (process.source !== "drm") continue
         var key = (gpu.pciAddress || gpu.id) + ":" + process.pid
-        var previous = root.processCounterSamples[key]
-        process.gfxPercent = null
-        process.computePercent = null
-        if (previous && elapsedNs > 0) {
-          var gfxDelta = Math.max(0, (process.engineGfxNs || 0) - previous.gfx)
-          var computeDelta = Math.max(0, (process.engineComputeNs || 0) - previous.compute)
-          process.gfxPercent = Math.min(100, gfxDelta * 100 / elapsedNs)
-          process.computePercent = Math.min(100, computeDelta * 100 / elapsedNs)
+        var previousDisplay = displaySamples[key] || ({})
+
+        if (process.source === "drm") {
+          var previous = root.processCounterSamples[key]
+          process.gfxPercent = previousDisplay.gfx !== undefined ? previousDisplay.gfx : 0
+          process.computePercent = previousDisplay.compute !== undefined ? previousDisplay.compute : 0
+          if (previous && elapsedNs > 0) {
+            var gfxDelta = Math.max(0, (process.engineGfxNs || 0) - previous.gfx)
+            var computeDelta = Math.max(0, (process.engineComputeNs || 0) - previous.compute)
+            process.gfxPercent = Math.min(100, gfxDelta * 100 / elapsedNs)
+            process.computePercent = Math.min(100, computeDelta * 100 / elapsedNs)
+          }
+          nextSamples[key] = {
+            gfx: process.engineGfxNs || 0,
+            compute: process.engineComputeNs || 0
+          }
+        } else if (process.source === "nvidia") {
+          if (process.gfxPercent === null || process.gfxPercent === undefined)
+            process.gfxPercent = previousDisplay.gfx !== undefined
+              ? previousDisplay.gfx : ((process.processType || "").indexOf("G") !== -1 ? 0 : null)
+          if (process.computePercent === null || process.computePercent === undefined)
+            process.computePercent = previousDisplay.compute !== undefined
+              ? previousDisplay.compute : ((process.processType || "").indexOf("C") !== -1 ? 0 : null)
+          if (process.memoryPercent === null || process.memoryPercent === undefined)
+            process.memoryPercent = previousDisplay.memory !== undefined ? previousDisplay.memory : 0
         }
-        nextSamples[key] = {
-          gfx: process.engineGfxNs || 0,
-          compute: process.engineComputeNs || 0
+
+        displaySamples[key] = {
+          gfx: process.gfxPercent,
+          compute: process.computePercent,
+          memory: process.memoryPercent
         }
       }
     }
 
     root.processCounterSamples = nextSamples
+    root.processDisplaySamples = displaySamples
     root.processSampleTimeMs = now
     return gpus
   }
