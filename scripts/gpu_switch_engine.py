@@ -381,6 +381,11 @@ def is_route_target(target):
     return target in ("amd", "nvidia") or bool(re.fullmatch(r"dri:pci-[0-9a-fA-F_]+", target))
 
 
+def is_drm_card_id(card_id):
+    """Accept only kernel DRM card names, never paths or shell syntax."""
+    return isinstance(card_id, str) and bool(re.fullmatch(r"card[0-9]+", card_id))
+
+
 def render_toggle_content(target):
     values = env_values_for_gpu(target)
     lines = [
@@ -424,6 +429,9 @@ def get_driver(card_id):
 
 
 def set_performance_level(card_id, level):
+    if not is_drm_card_id(card_id):
+        return {"status": "error", "message": f"Invalid DRM card ID: {card_id}"}
+
     allowed_levels = {"auto", "low", "high", "profile_peak"}
     if level not in allowed_levels:
         return {"status": "error", "message": f"Invalid power governor: {level}"}
@@ -436,7 +444,7 @@ def set_performance_level(card_id, level):
             dev_path.write_text(level)
             return {"status": "success", "level": level, "method": "direct"}
         except (PermissionError, OSError):
-            cmd = f"echo '{level}' > {dev_path}"
+            cmd = f"printf %s {shlex.quote(level)} > {shlex.quote(str(dev_path))}"
             try:
                 subprocess.run(["pkexec", "sh", "-c", cmd], check=True, capture_output=True, text=True)
                 return {"status": "success", "level": level, "method": "pkexec"}
@@ -462,6 +470,9 @@ def set_performance_level(card_id, level):
 
 
 def set_fan_pwm(card_id, pwm_val):
+    if not is_drm_card_id(card_id):
+        return {"status": "error", "message": f"Invalid DRM card ID: {card_id}"}
+
     hwmon_dirs = list(Path(f"/sys/class/drm/{card_id}/device/hwmon").glob("hwmon*"))
     if hwmon_dirs:
         hdir = hwmon_dirs[0]
@@ -473,7 +484,7 @@ def set_fan_pwm(card_id, pwm_val):
                 pwm_enable_file.write_text("2")
                 return {"status": "success", "mode": "auto", "method": "direct"}
             except (PermissionError, OSError):
-                cmd = f"echo '2' > {pwm_enable_file}"
+                cmd = f"printf %s 2 > {shlex.quote(str(pwm_enable_file))}"
                 try:
                     subprocess.run(["pkexec", "sh", "-c", cmd], check=True, capture_output=True, text=True)
                     return {"status": "success", "mode": "auto", "method": "pkexec"}
@@ -489,7 +500,10 @@ def set_fan_pwm(card_id, pwm_val):
                 pwm_file.write_text(str(pwm_num))
                 return {"status": "success", "pwm": pwm_num, "method": "direct"}
             except (PermissionError, OSError):
-                cmd = f"echo '1' > {pwm_enable_file} && echo '{pwm_num}' > {pwm_file}"
+                cmd = (
+                    f"printf %s 1 > {shlex.quote(str(pwm_enable_file))} && "
+                    f"printf %s {shlex.quote(str(pwm_num))} > {shlex.quote(str(pwm_file))}"
+                )
                 try:
                     subprocess.run(["pkexec", "sh", "-c", cmd], check=True, capture_output=True, text=True)
                     return {"status": "success", "pwm": pwm_num, "method": "pkexec"}
