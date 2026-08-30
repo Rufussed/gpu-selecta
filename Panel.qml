@@ -22,6 +22,10 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.45)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  property color themeGreen: Color.accent
+  property color themeYellow: root.urgent
+  property color themeCyan: Color.accent
+  property color themeUrgent: root.urgent
 
   property var gpus: []
   readonly property var orderedGpus: {
@@ -45,6 +49,7 @@ Panel {
   property string appFilter: ""
   property string expandedGpuId: ""
   property var expandedProcessGpuIds: ({})
+  property var processScrollPositions: ({})
   property var processCounterSamples: ({})
   property var processDisplaySamples: ({})
   property double processSampleTimeMs: 0
@@ -172,33 +177,28 @@ Panel {
 
   function gaugeColor(metric, value, ratio) {
     var pct = ratio * 100
-    var yellowAt = 60
-    var orangeAt = 80
-    var redAt = 90
+    var elevatedAt = 60
+    var criticalAt = 90
 
     if (metric === "temperature") {
       pct = value
-      yellowAt = 65
-      orangeAt = 80
-      redAt = 90
+      elevatedAt = 65
+      criticalAt = 90
     } else if (metric === "vram") {
-      yellowAt = 70
-      orangeAt = 85
-      redAt = 95
+      elevatedAt = 70
+      criticalAt = 95
     } else if (metric === "busy") {
-      yellowAt = 60
-      orangeAt = 80
-      redAt = 95
+      elevatedAt = 60
+      criticalAt = 95
     } else if (metric === "power") {
-      yellowAt = 50
-      orangeAt = 75
-      redAt = 90
+      elevatedAt = 50
+      criticalAt = 90
     }
 
-    if (pct >= redAt) return root.urgent
-    if (pct >= orangeAt) return "#d4843e"
-    if (pct >= yellowAt) return "#e6b450"
-    return "#87c095"
+    if (pct >= criticalAt) return root.themeUrgent
+    if (pct >= elevatedAt) return root.themeYellow
+    if (metric === "vram") return root.themeCyan
+    return root.themeGreen
   }
 
   function temperatureGaugeMax(gpu) {
@@ -217,30 +217,24 @@ Panel {
     return Math.max(process.gfxPercent || 0, process.computePercent || 0)
   }
 
-  function processLoadLabel(process) {
-    var parts = []
-    if (process.gfxPercent !== null && process.gfxPercent !== undefined)
-      parts.push("G " + process.gfxPercent.toFixed(1) + "%")
-    if (process.computePercent !== null && process.computePercent !== undefined)
-      parts.push("C " + process.computePercent.toFixed(1) + "%")
-    if (process.memoryPercent !== null && process.memoryPercent !== undefined)
-      parts.push("M " + process.memoryPercent.toFixed(0) + "%")
-    return parts.length > 0 ? parts.join(" · ") : "0%"
+  function processAttributedLoad(process, gpu) {
+    var processes = gpu.processes || []
+    var measuredTotal = 0
+    for (var i = 0; i < processes.length; i++)
+      measuredTotal += root.processLoad(processes[i])
+
+    if (measuredTotal <= 0 || gpu.busyPercent === null || gpu.busyPercent === undefined)
+      return 0
+
+    return root.processLoad(process) / measuredTotal *
+      Math.max(0, Math.min(100, gpu.busyPercent))
   }
 
-  function processMemoryLabel(process) {
-    if (process.vramMb === null || process.vramMb === undefined || process.vramMb <= 0) return ""
-    return process.vramMb >= 1024
-      ? (process.vramMb / 1024).toFixed(1) + " GB"
-      : process.vramMb.toFixed(0) + " MB"
-  }
-
-  function monitorOutputNote(process, gpu) {
-    var compositorNames = ["hyprland", "kwin_wayland", "gnome-shell", "weston"]
-    var outputs = gpu.connectedOutputs || []
-    if (compositorNames.indexOf((process.name || "").toLowerCase()) === -1 || outputs.length === 0)
-      return ""
-    return "Driving " + outputs.join(", ")
+  function processVramPercent(process, gpu) {
+    if (process.vramMb !== null && process.vramMb !== undefined &&
+        gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined && gpu.vramTotalMb > 0)
+      return Math.max(0, Math.min(100, process.vramMb / gpu.vramTotalMb * 100))
+    return Math.max(0, Math.min(100, process.memoryPercent || 0))
   }
 
   function gpuProcessesExpanded(gpuId) {
@@ -253,6 +247,16 @@ Panel {
     root.expandedProcessGpuIds = updated
   }
 
+  function processScrollPosition(gpuId) {
+    return root.processScrollPositions[gpuId] || 0
+  }
+
+  function rememberProcessScrollPosition(gpuId, position) {
+    var updated = Object.assign({}, root.processScrollPositions)
+    updated[gpuId] = position
+    root.processScrollPositions = updated
+  }
+
   function visibleGpuProcesses(processes) {
     var rows = (processes || []).slice()
     rows.sort(function(a, b) {
@@ -260,11 +264,7 @@ Panel {
       if (loadDifference !== 0) return loadDifference
       return (b.vramMb || 0) - (a.vramMb || 0)
     })
-    if (root.processSampleTimeMs > 0) {
-      var active = rows.filter(function(process) { return root.processLoad(process) >= 0.1 })
-      if (active.length > 0) rows = active
-    }
-    return rows.slice(0, 6)
+    return rows
   }
 
   function annotateProcessLoads(gpus) {
@@ -379,6 +379,11 @@ Panel {
     if (!text || text.trim() === "") return
     try {
       var data = JSON.parse(text)
+      var themeColors = data.themeColors || ({})
+      root.themeGreen = themeColors.green || Color.accent
+      root.themeYellow = themeColors.yellow || root.urgent
+      root.themeCyan = themeColors.cyan || Color.accent
+      root.themeUrgent = themeColors.urgent || root.urgent
       root.gpus = root.annotateProcessLoads(data.gpus || [])
       root.isHybrid = data.isHybrid === true
       root.renderDefault = data.renderDefault || "amd"
@@ -960,18 +965,18 @@ Panel {
                   Repeater {
                     model: [
                       {
-                        available: gpu.tempC !== null && gpu.tempC !== undefined,
-                        metric: "temperature",
-                        value: gpu.tempC || 0,
-                        label: "Temp: " + Math.round(gpu.tempC || 0) + "°C",
-                        ratio: root.gaugeRatio(gpu.tempC, 0, root.temperatureGaugeMax(gpu))
-                      },
-                      {
                         available: gpu.busyPercent !== null && gpu.busyPercent !== undefined,
                         metric: "busy",
                         value: gpu.busyPercent || 0,
-                        label: "GPU Load: " + (gpu.busyPercent || 0) + "%",
+                        label: "Load: " + (gpu.busyPercent || 0) + "%",
                         ratio: root.gaugeRatio(gpu.busyPercent, 0, 100)
+                      },
+                      {
+                        available: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined,
+                        metric: "vram",
+                        value: gpu.vramPercent || 0,
+                        label: "VRAM: " + ((gpu.vramPercent !== null && gpu.vramPercent !== undefined) ? gpu.vramPercent : 0) + "%",
+                        ratio: root.gaugeRatio(gpu.vramPercent, 0, 100)
                       },
                       {
                         available: gpu.powerWatts !== null && gpu.powerWatts !== undefined,
@@ -981,11 +986,11 @@ Panel {
                         ratio: root.gaugeRatio(gpu.powerWatts, 0, root.powerGaugeMax(gpu))
                       },
                       {
-                        available: gpu.vramTotalMb !== null && gpu.vramTotalMb !== undefined,
-                        metric: "vram",
-                        value: gpu.vramPercent || 0,
-                        label: "VRAM: " + ((gpu.vramPercent !== null && gpu.vramPercent !== undefined) ? gpu.vramPercent : 0) + "%",
-                        ratio: root.gaugeRatio(gpu.vramPercent, 0, 100)
+                        available: gpu.tempC !== null && gpu.tempC !== undefined,
+                        metric: "temperature",
+                        value: gpu.tempC || 0,
+                        label: "Temp: " + Math.round(gpu.tempC || 0) + "°C",
+                        ratio: root.gaugeRatio(gpu.tempC, 0, root.temperatureGaugeMax(gpu))
                       }
                     ]
 
@@ -1014,152 +1019,18 @@ Panel {
                         anchors.leftMargin: Style.space(8)
                         anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
-                        height: Style.space(6)
-                        radius: height / 2
-                        color: Qt.darker(root.foreground, 4)
+                        height: Style.space(8)
+                        radius: 0
+                        color: Color.muted
 
                         Rectangle {
                           width: metricBarTrack.width * modelData.ratio
                           height: parent.height
-                          radius: height / 2
+                          radius: 0
                           color: root.gaugeColor(modelData.metric, modelData.value, modelData.ratio)
                         }
                       }
                     }
-                  }
-                }
-
-                // ------------------ PER-PROCESS GPU LOAD ------------------
-                Column {
-                  width: parent.width
-                  spacing: Style.space(5)
-
-                  PanelSeparator { width: parent.width }
-
-                  Item {
-                    width: parent.width
-                    implicitHeight: processHeaderRow.implicitHeight + Style.space(4)
-
-                    Row {
-                      id: processHeaderRow
-                      anchors.left: parent.left
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-
-                      Text {
-                        width: parent.width * 0.7
-                        textFormat: Text.PlainText
-                        text: (processListExpanded ? "▾  " : "▸  ") + "Active GPU Load"
-                        color: processListExpanded ? Color.accent : root.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.bold: true
-                      }
-
-                      Text {
-                        width: parent.width * 0.3
-                        horizontalAlignment: Text.AlignRight
-                        textFormat: Text.PlainText
-                        text: (gpu.processes || []).length + " contexts"
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                      }
-                    }
-
-                    MouseArea {
-                      anchors.fill: parent
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.toggleGpuProcesses(gpu.id)
-                    }
-                  }
-
-                  Text {
-                    visible: processListExpanded && (!gpu.processes || gpu.processes.length === 0)
-                    width: parent.width
-                    textFormat: Text.PlainText
-                    text: "No readable GPU processes"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  Repeater {
-                    model: processListExpanded ? root.visibleGpuProcesses(gpu.processes) : []
-
-                    delegate: Column {
-                      required property var modelData
-                      readonly property real displayedLoad: root.processLoad(modelData)
-                      width: parent.width
-                      spacing: Style.space(2)
-
-                      Row {
-                        width: parent.width
-
-                        Column {
-                          width: parent.width * 0.43
-                          spacing: 0
-
-                          Text {
-                            width: parent.width
-                            textFormat: Text.PlainText
-                            text: modelData.name + (modelData.system ? " · system" : "")
-                            color: modelData.system ? root.dim : root.foreground
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.caption
-                            elide: Text.ElideRight
-                          }
-
-                          Text {
-                            visible: root.monitorOutputNote(modelData, gpu) !== ""
-                            width: parent.width
-                            textFormat: Text.PlainText
-                            text: root.monitorOutputNote(modelData, gpu)
-                            color: Color.accent
-                            font.family: root.fontFamily
-                            font.pixelSize: Math.max(8, Style.font.caption - 2)
-                            elide: Text.ElideRight
-                          }
-                        }
-
-                        Text {
-                          width: parent.width * 0.57
-                          horizontalAlignment: Text.AlignRight
-                          textFormat: Text.PlainText
-                          text: root.processLoadLabel(modelData) +
-                            (root.processMemoryLabel(modelData) ? " · " + root.processMemoryLabel(modelData) : "")
-                          color: displayedLoad >= 0.1 ? Color.accent : root.dim
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                          elide: Text.ElideLeft
-                        }
-                      }
-
-                      Rectangle {
-                        width: parent.width
-                        height: Style.space(3)
-                        radius: height / 2
-                        color: Qt.darker(root.foreground, 4)
-
-                        Rectangle {
-                          width: parent.width * Math.min(1, displayedLoad / 100)
-                          height: parent.height
-                          radius: height / 2
-                          color: root.gaugeColor("busy", displayedLoad, displayedLoad / 100)
-                        }
-                      }
-                    }
-                  }
-
-                  Text {
-                    readonly property int shownCount: root.visibleGpuProcesses(gpu.processes).length
-                    visible: processListExpanded && (gpu.processes || []).length > shownCount
-                    width: parent.width
-                    textFormat: Text.PlainText
-                    text: "+ " + ((gpu.processes || []).length - shownCount) + " more GPU contexts"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
                   }
                 }
 
@@ -1296,6 +1167,7 @@ Panel {
                             anchors.centerIn: parent
                             text: modelData.label
                             color: isActive ? root.foreground : root.dim
+
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                             font.bold: isActive
@@ -1306,6 +1178,209 @@ Panel {
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.setFanPwm(gpu.id, modelData.pwm)
                           }
+                        }
+                      }
+                    }
+                  }
+                }
+
+                // ------------------ PER-PROCESS GPU LOAD ------------------
+                Column {
+                  width: parent.width
+                  spacing: Style.space(5)
+
+                  PanelSeparator { width: parent.width }
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: processHeaderRow.implicitHeight + Style.space(4)
+
+                    Row {
+                      id: processHeaderRow
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(3)
+
+                      Item {
+                        id: processDisclosureArrow
+                        width: Style.space(14)
+                        height: processHeaderLabel.implicitHeight
+
+                        Text {
+                          anchors.centerIn: parent
+                          anchors.verticalCenterOffset: 0
+                          textFormat: Text.PlainText
+                          text: processListExpanded ? "▾" : "▸"
+                          color: processListExpanded ? Color.accent : root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.body + 2
+                          font.bold: true
+                        }
+                      }
+
+                      Text {
+                        id: processHeaderLabel
+                        width: parent.width * 0.7 - processDisclosureArrow.width - processHeaderRow.spacing
+                        textFormat: Text.PlainText
+                        text: "Active GPU Load"
+                        color: processListExpanded ? Color.accent : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+
+                      Text {
+                        width: parent.width * 0.3
+                        horizontalAlignment: Text.AlignRight
+                        textFormat: Text.PlainText
+                        text: (gpu.processes || []).length + " processes"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.toggleGpuProcesses(gpu.id)
+                    }
+                  }
+
+                  Text {
+                    visible: processListExpanded && (!gpu.processes || gpu.processes.length === 0)
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: "No readable GPU processes"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Flickable {
+                    id: processFlick
+                    visible: processListExpanded && gpu.processes && gpu.processes.length > 0
+                    width: parent.width
+                    height: Math.min(processRows.implicitHeight,
+                      processColumnHeader.implicitHeight + processRows.spacing +
+                      Math.min(7, processRepeater.count) * processRows.processRowHeight +
+                      Math.max(0, Math.min(7, processRepeater.count) - 1) * processRows.spacing)
+                    contentWidth: width
+                    contentHeight: processRows.implicitHeight
+                    contentY: root.processScrollPosition(gpu.id)
+                    clip: true
+                    interactive: contentHeight > height
+                    boundsBehavior: Flickable.StopAtBounds
+
+                    onContentYChanged: {
+                      // An attached ScrollBar can update contentY without marking
+                      // the Flickable as moving. Ignore only the artificial clamp
+                      // to zero while a refreshed delegate is being torn down.
+                      if (contentY > 0 || moving)
+                        root.rememberProcessScrollPosition(gpu.id, contentY)
+                    }
+
+                    onMovementEnded:
+                      root.rememberProcessScrollPosition(gpu.id, contentY)
+
+                    ScrollBar.vertical: ScrollBar {
+                      width: Style.space(8)
+                      policy: processFlick.contentHeight > processFlick.height
+                        ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+                    }
+
+                    Column {
+                      id: processRows
+                      readonly property real processRowHeight:
+                        processRepeater.count > 0 && processRepeater.itemAt(0)
+                          ? processRepeater.itemAt(0).implicitHeight : Style.space(12)
+                      width: processFlick.width -
+                        (processFlick.contentHeight > processFlick.height ? Style.space(16) : 0)
+                      spacing: Style.space(5)
+
+                      Row {
+                        id: processColumnHeader
+                        width: parent.width
+                        spacing: Style.space(5)
+
+                        Repeater {
+                          model: [
+                            { label: "Process", widthRatio: 0.31 },
+                            { label: "Load", widthRatio: 0.325 },
+                            { label: "VRAM", widthRatio: 0.325 }
+                          ]
+
+                          delegate: Text {
+                            required property var modelData
+                            width: parent.width * modelData.widthRatio
+                            textFormat: Text.PlainText
+                            text: modelData.label
+                            color: root.dim
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.bold: true
+                            elide: Text.ElideRight
+                          }
+                        }
+                      }
+
+                      Repeater {
+                        id: processRepeater
+                        model: root.visibleGpuProcesses(gpu.processes)
+
+                        delegate: Column {
+                          required property var modelData
+                          readonly property real displayedLoad: root.processAttributedLoad(modelData, gpu)
+                          readonly property real displayedVram: root.processVramPercent(modelData, gpu)
+                          width: parent.width
+                          spacing: Style.space(2)
+
+                          Row {
+                            width: parent.width
+                            spacing: Style.space(5)
+
+                            Text {
+                              width: parent.width * 0.31
+                              textFormat: Text.PlainText
+                              text: modelData.name + (modelData.system ? " · SYS" : "")
+                              color: modelData.system ? root.dim : root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              elide: Text.ElideRight
+                            }
+
+                            Rectangle {
+                              width: parent.width * 0.325
+                              height: Style.space(10)
+                              anchors.verticalCenter: parent.verticalCenter
+                              radius: 0
+                              color: Color.muted
+
+                              Rectangle {
+                                width: parent.width * Math.min(1, displayedLoad / 100)
+                                height: parent.height
+                                radius: 0
+                                color: root.gaugeColor("busy", displayedLoad, displayedLoad / 100)
+                              }
+                            }
+
+                            Rectangle {
+                              width: parent.width * 0.325
+                              height: Style.space(10)
+                              anchors.verticalCenter: parent.verticalCenter
+                              radius: 0
+                              color: Color.muted
+
+                              Rectangle {
+                                width: parent.width * Math.min(1, displayedVram / 100)
+                                height: parent.height
+                                radius: 0
+                                color: root.gaugeColor("vram", displayedVram, displayedVram / 100)
+                              }
+                            }
+                          }
+
                         }
                       }
                     }

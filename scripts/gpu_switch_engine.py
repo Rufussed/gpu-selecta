@@ -40,6 +40,7 @@ import re
 import json
 import shlex
 import subprocess
+import tomllib
 from pathlib import Path
 
 HOME = Path.home()
@@ -57,6 +58,7 @@ APP_GPU_MARKER = "# Written by the GPU Switch plugin — per-app GPU override\n"
 TELEMETRY_EXTREMA_FILE = (
     HOME / ".local" / "state" / "omarchy" / "gpu-selecta" / "telemetry-extrema.json"
 )
+THEME_COLORS_FILE = HOME / ".local" / "state" / "omarchy" / "current" / "theme" / "colors.toml"
 
 # Standard XDG desktop-entry field codes — kept in place (appended after the
 # wrapper path) so launchers that do proper Exec= parsing still see them and
@@ -72,6 +74,27 @@ def read_sysfs(path):
     except Exception:
         pass
     return None
+
+
+def read_theme_bar_colors():
+    """Read bar colors from the active Omarchy theme without adding dependencies."""
+    try:
+        with THEME_COLORS_FILE.open("rb") as colors_file:
+            colors = tomllib.load(colors_file)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+    palette = {}
+    for output_name, theme_name in {
+        "green": "green",
+        "yellow": "yellow",
+        "cyan": "cyan",
+        "urgent": "red",
+    }.items():
+        value = colors.get(theme_name)
+        if isinstance(value, str) and re.fullmatch(r"#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?", value):
+            palette[output_name] = value
+    return palette
 
 
 def _is_number(s):
@@ -1003,6 +1026,7 @@ def main():
 
     output = {
         "gpus": gpus,
+        "themeColors": read_theme_bar_colors(),
         "isHybrid": is_hybrid,
         "renderDefault": render_default,
     }
