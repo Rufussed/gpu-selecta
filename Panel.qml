@@ -348,6 +348,10 @@ Panel {
   }
 
   function setRenderDefault(target) {
+    // Reflect the choice immediately rather than waiting on the round trip —
+    // the refresh() at the end of controlProc's handler corrects this back
+    // if the engine call actually failed.
+    root.renderDefault = target
     controlProc.command = ["python3", root.scriptPath(), "--set-render-default", target]
     controlProc.running = true
   }
