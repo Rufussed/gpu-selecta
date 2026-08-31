@@ -4,9 +4,13 @@ GPU Selecta Engine
 Global default-renderer selection, live telemetry, and per-app GPU pinning
 for multi-GPU Linux systems via Mesa or NVIDIA PRIME render offload.
 
-This is NOT a hardware GPU mux — muxless Optimus-style laptops have no
-display path from the discrete GPU, so the panel-owning GPU never changes.
-What this does is control which GPU newly-launched apps render on:
+This is NOT a hardware GPU mux — on a muxless Optimus-style laptop the
+internal panel has no display path from the discrete GPU, so it never
+changes owners. An external output wired to the discrete GPU (common for
+HDMI/DP on gaming laptops) is a separate matter: the discrete GPU still
+owns that connector's scanout regardless of any selection here, even though
+the frame is rendered elsewhere and handed to it via dma-buf. What this
+controls is only which GPU newly-launched apps render (and decode) on:
 
 - Global toggle: writes an Omarchy Hyprland "toggle" file
   (~/.local/state/omarchy/toggles/hypr/) that sets PRIME offload env vars via
@@ -64,6 +68,23 @@ THEME_COLORS_FILE = HOME / ".local" / "state" / "omarchy" / "current" / "theme" 
 # wrapper path) so launchers that do proper Exec= parsing still see them and
 # substitute file/url args in.
 FIELD_CODES = {"%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m"}
+
+# Omarchy's default Hyprland config (default/hypr/nvidia.lua) sets
+# LIBVA_DRIVER_NAME=nvidia session-wide whenever an NVIDIA GPU is present,
+# regardless of which GPU actually renders the desktop — it assumes the
+# NVIDIA GPU is the render target. On a hybrid laptop where AMD/Intel is the
+# selected render GPU, that leftover var still forces VA-API video decode
+# onto NVIDIA. Chromium then decodes on NVIDIA but composites on the other
+# GPU, and importing the decoded frame across GPUs as a shared dma-buf is
+# what intermittently fails (EGL_BAD_MATCH, vaEndPicture errors, black video
+# with a wedged GPU process). Pinning LIBVA_DRIVER_NAME to match the selected
+# Mesa GPU keeps decode and composite on the same device.
+LIBVA_DRIVER_BY_KERNEL_DRIVER = {
+    "amdgpu": "radeonsi",
+    "radeon": "radeonsi",
+    "i915": "iHD",
+    "xe": "iHD",
+}
 
 
 def read_sysfs(path):
@@ -562,10 +583,10 @@ def is_drm_card_id(card_id):
     return isinstance(card_id, str) and bool(re.fullmatch(r"card[0-9]+", card_id))
 
 
-def render_toggle_content(target):
-    values = env_values_for_gpu(target)
+def render_toggle_content(target, gpus=()):
+    values = env_values_for_gpu(target, gpus)
     lines = [
-        "-- Written by the GPU Selecta plugin. Delete this file to use the system-default GPU.",
+        "-- Written by the GPU Selecta plugin. Delete this file to fall back to Omarchy's raw session defaults.",
         f"{RENDER_TARGET_MARKER}{target}",
     ]
     for name, value in values.items():
@@ -579,12 +600,17 @@ def set_render_default(target):
     if not is_route_target(target) or target not in available:
         return {"status": "error", "message": f"Invalid render default: {target}"}
 
+    # Always write an explicit toggle, including for "amd" — Omarchy's own
+    # Hyprland default (default/hypr/nvidia.lua) unconditionally sets
+    # LIBVA_DRIVER_NAME=nvidia (and __GLX_VENDOR_LIBRARY_NAME=nvidia)
+    # session-wide whenever an NVIDIA GPU is present. That default loads
+    # before this plugin's toggle on every `hyprctl reload`, so previously
+    # deleting the toggle for "amd" left those NVIDIA-biased vars in effect
+    # for every AMD-routed process instead of clearing them.
+    values = env_values_for_gpu(target, gpus)
     try:
-        if target != "amd":
-            RENDER_TOGGLE_DIR.mkdir(parents=True, exist_ok=True)
-            RENDER_TOGGLE_FILE.write_text(render_toggle_content(target))
-        else:
-            RENDER_TOGGLE_FILE.unlink(missing_ok=True)
+        RENDER_TOGGLE_DIR.mkdir(parents=True, exist_ok=True)
+        RENDER_TOGGLE_FILE.write_text(render_toggle_content(target, gpus))
     except OSError as e:
         return {"status": "error", "message": str(e)}
 
@@ -594,6 +620,34 @@ def set_render_default(target):
         return {
             "status": "error",
             "message": f"Wrote render default but 'hyprctl reload' failed: {e}",
+        }
+
+    # `hyprctl reload` only updates Hyprland's own process environment (what
+    # hl.env() sets). Apps launched normally don't fork directly from
+    # Hyprland — Hyprland wraps them in a systemd --user scope
+    # (app-Hyprland-*.scope), which gets its environment from the systemd
+    # --user manager's environment block instead. That block is populated
+    # once at login by Omarchy's autostart (systemctl --user
+    # import-environment + dbus-update-activation-environment) and is never
+    # refreshed on reload, so without this step every scope-launched app
+    # keeps using the stale pre-toggle vars even though the toggle file and
+    # Hyprland's own env are already correct. Run the same re-import
+    # Omarchy's autostart does, but as a child of Hyprland (via hl.exec_cmd)
+    # so it inherits the environment hl.env() just set, not this script's.
+    var_names = " ".join(values.keys())
+    propagate_cmd = (
+        f"systemctl --user import-environment {var_names}; "
+        f"dbus-update-activation-environment --systemd {var_names}"
+    )
+    try:
+        subprocess.run(
+            ["hyprctl", "eval", f'hl.exec_cmd("{propagate_cmd}")'],
+            check=True, capture_output=True, text=True, timeout=3.0,
+        )
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Wrote render default but propagating env to systemd failed: {e}",
         }
 
     return {"status": "success", "renderDefault": target}
@@ -832,27 +886,38 @@ def get_pristine_desktop_content(basename):
     return source
 
 
-def env_values_for_gpu(gpu):
+def env_values_for_gpu(gpu, gpus=()):
+    """Env vars for a render target. `gpus` (from scan_gpu_telemetry) is used
+    to resolve the correct VA-API decoder driver for the target GPU — see
+    LIBVA_DRIVER_BY_KERNEL_DRIVER above for why this must be pinned
+    explicitly rather than left to Omarchy's NVIDIA-biased session default."""
     values = {
         "DRI_PRIME": "",
         "__NV_PRIME_RENDER_OFFLOAD": "",
         "__GLX_VENDOR_LIBRARY_NAME": "",
         "__VK_LAYER_NV_optimus": "",
+        "LIBVA_DRIVER_NAME": "",
     }
     if gpu == "nvidia":
         values.update({
             "__NV_PRIME_RENDER_OFFLOAD": "1",
             "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
             "__VK_LAYER_NV_optimus": "NVIDIA_only",
+            "LIBVA_DRIVER_NAME": "nvidia",
         })
-    elif gpu.startswith("dri:"):
-        values["DRI_PRIME"] = gpu[len("dri:"):]
+    else:
+        if gpu.startswith("dri:"):
+            values["DRI_PRIME"] = gpu[len("dri:"):]
+        target_gpu = next((g for g in gpus if g.get("routeKey") == gpu), None)
+        libva_driver = LIBVA_DRIVER_BY_KERNEL_DRIVER.get((target_gpu or {}).get("driver"))
+        if libva_driver:
+            values["LIBVA_DRIVER_NAME"] = libva_driver
     return values
 
 
-def env_lines_for_gpu(gpu):
+def env_lines_for_gpu(gpu, gpus=()):
     lines = []
-    for name, value in env_values_for_gpu(gpu).items():
+    for name, value in env_values_for_gpu(gpu, gpus).items():
         lines.append(f"export {name}={shlex.quote(value)}" if value else f"unset {name}")
     return lines
 
@@ -879,12 +944,12 @@ def remove_wrappers_for_basename(basename):
             pass
 
 
-def rewrite_exec_lines(content, basename, gpu):
+def rewrite_exec_lines(content, basename, gpu, gpus=()):
     """Point every Exec= line at a generated wrapper script instead of
     prefixing it with `env VAR=val ...` directly — see the module docstring
     for why. field codes (%U etc.) stay in Exec= itself, after the wrapper
     path, so spec-compliant launchers still substitute args into them."""
-    env_lines = env_lines_for_gpu(gpu)
+    env_lines = env_lines_for_gpu(gpu, gpus)
     slug = slugify(Path(basename).stem)
     APP_GPU_WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -920,7 +985,7 @@ def rewrite_exec_lines(content, basename, gpu):
     return "".join(out_lines)
 
 
-def apply_desktop_gpu(basename, gpu):
+def apply_desktop_gpu(basename, gpu, gpus=()):
     system_path = SYSTEM_APPLICATIONS_DIR / basename
     user_path = USER_APPLICATIONS_DIR / basename
 
@@ -953,7 +1018,7 @@ def apply_desktop_gpu(basename, gpu):
     if pristine is None:
         return {"status": "error", "message": f"{basename} not found", "file": basename}
 
-    rewritten = APP_GPU_MARKER + rewrite_exec_lines(pristine, basename, gpu)
+    rewritten = APP_GPU_MARKER + rewrite_exec_lines(pristine, basename, gpu, gpus)
 
     try:
         USER_APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -979,7 +1044,8 @@ def set_app_gpu(app_key, gpu, label=None, desktop_files=None):
     else:
         return {"status": "error", "message": f"Unknown app: {app_key}"}
 
-    results = [apply_desktop_gpu(f, gpu) for f in entry.get("desktopFiles", [])]
+    gpus = scan_gpu_telemetry() if gpu != "auto" else ()
+    results = [apply_desktop_gpu(f, gpu, gpus) for f in entry.get("desktopFiles", [])]
     failures = [r for r in results if r["status"] == "error"]
 
     entry["gpu"] = gpu
